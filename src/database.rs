@@ -227,4 +227,43 @@ mod tests {
         drop(directory);
         assert!(!temporary_directory.exists());
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deployment_generation_survives_database_restart() {
+        let directory = TestDatabaseDirectory::new();
+        let path_string = directory.path().to_string_lossy().into_owned();
+        let info = serde_json::to_string(&crate::peer::PeerInfo {
+            ip: "192.0.2.10".to_owned(),
+            deployment_generation: 7,
+        })
+        .unwrap();
+
+        let first = super::Database::new(&path_string).await.unwrap();
+        first
+            .insert_peer("device01", b"device-uuid", &[9_u8; 32], &info)
+            .await
+            .unwrap();
+        let connections = first.pool.retain(|_, _| false).removed;
+        first.pool.close();
+        drop(first);
+        for connection in connections {
+            connection.close().await.unwrap();
+        }
+
+        let reopened = super::Database::new(&path_string).await.unwrap();
+        let stored = reopened.get_peer("device01").await.unwrap().unwrap();
+        let restored: crate::peer::PeerInfo = serde_json::from_str(&stored.info).unwrap();
+        assert_eq!(restored.ip, "192.0.2.10");
+        assert_eq!(restored.deployment_generation, 7);
+
+        let connections = reopened.pool.retain(|_, _| false).removed;
+        reopened.pool.close();
+        drop(reopened);
+        for connection in connections {
+            connection.close().await.unwrap();
+        }
+        let temporary_directory = directory.directory().to_owned();
+        drop(directory);
+        assert!(!temporary_directory.exists());
+    }
 }

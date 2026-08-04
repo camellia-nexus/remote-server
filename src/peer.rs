@@ -161,6 +161,8 @@ pub(crate) async fn cleanup_transient_state() -> (usize, usize) {
 pub(crate) struct PeerInfo {
     #[serde(default)]
     pub(crate) ip: String,
+    #[serde(default)]
+    pub(crate) deployment_generation: u64,
 }
 
 pub(crate) struct Peer {

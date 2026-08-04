@@ -33,6 +33,7 @@ use camellia_remote_protocol::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
+use serde_derive::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -72,6 +73,8 @@ const RELAY_SERVER_NAME_MAX_LEN: usize = 512;
 const PEER_CACHE_CLEANUP_INTERVAL_SECS: u64 = 300;
 const PEER_CACHE_IDLE_SECS: u64 = 600;
 const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 30;
+const DEPLOYMENT_ASSERTION_VERSION: &str = "camellia-deployment-assertion-v1";
+const DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS: i64 = 60;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
 
 fn http_proxy_error(status: i32, code: ErrorCode) -> HttpProxyResponse {
@@ -81,6 +84,88 @@ fn http_proxy_error(status: i32, code: ErrorCode) -> HttpProxyResponse {
     };
     response.typed_error = MessageField::some(error::for_code(code));
     response
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut normalized = [0_u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+#[derive(Deserialize)]
+struct DeploymentAssertion {
+    version: u8,
+    deployment_generation: u64,
+    request_nonce: String,
+    expires_at: i64,
+    assertion: String,
+}
+
+fn validate_deployment_assertion(
+    assertion: &DeploymentAssertion,
+    id: &str,
+    uuid: &[u8],
+    public_key_hash: &str,
+    request_nonce: &str,
+    secret: &str,
+    now: i64,
+) -> ResultType<u64> {
+    if assertion.version != 1
+        || !constant_time_eq(assertion.request_nonce.as_bytes(), request_nonce.as_bytes())
+    {
+        bail!("API returned an invalid deployment assertion");
+    }
+    if assertion.expires_at < now
+        || assertion.expires_at > now + DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS
+    {
+        bail!("API returned an expired deployment assertion");
+    }
+    let message = [
+        DEPLOYMENT_ASSERTION_VERSION,
+        id,
+        &BASE64.encode(uuid),
+        public_key_hash,
+        &assertion.deployment_generation.to_string(),
+        request_nonce,
+        &assertion.expires_at.to_string(),
+    ]
+    .join("\n");
+    let supplied = BASE64
+        .decode(assertion.assertion.as_bytes())
+        .context("API returned malformed deployment assertion encoding")?;
+    let expected = hmac_sha256(secret.as_bytes(), message.as_bytes());
+    if !constant_time_eq(&supplied, &expected) {
+        bail!("API returned an invalid deployment assertion signature");
+    }
+    Ok(assertion.deployment_generation)
 }
 
 #[derive(Clone, Debug)]
@@ -433,7 +518,7 @@ impl RendezvousServer {
         uuid: &Bytes,
         pk: &Bytes,
         ip: &str,
-        managed_authorized: bool,
+        managed_generation: Option<u64>,
     ) -> ResultType<PeerRegistrationStage> {
         if peer.persistence_in_progress {
             return Ok(PeerRegistrationStage::Busy);
@@ -441,10 +526,13 @@ impl RendezvousServer {
         if peer.uuid.is_empty() {
             // First registration claims the in-memory peer before database
             // I/O, closing the concurrent first-writer takeover window.
-        } else if managed_authorized {
-            // The management API is authoritative for a managed deployment.
-            // This permits an administrator-approved machine/key replacement
-            // without retaining the stale hbbs-local UUID forever.
+        } else if let Some(generation) = managed_generation {
+            let same_identity = peer.uuid == *uuid && peer.pk == *pk;
+            if generation < peer.info.deployment_generation
+                || (!same_identity && generation <= peer.info.deployment_generation)
+            {
+                return Ok(PeerRegistrationStage::UuidMismatch);
+            }
         } else if peer.uuid == *uuid {
             if peer.info.ip != ip && peer.pk != *pk {
                 log::warn!(
@@ -476,13 +564,22 @@ impl RendezvousServer {
         peer.reg_pk.1 = Instant::now();
 
         let ip_changed = !peer.uuid.is_empty() && peer.info.ip != ip;
-        let changed = peer.uuid.is_empty() || peer.uuid != *uuid || peer.pk != *pk || ip_changed;
+        let generation_changed = managed_generation
+            .is_some_and(|generation| generation != peer.info.deployment_generation);
+        let changed = peer.uuid.is_empty()
+            || peer.uuid != *uuid
+            || peer.pk != *pk
+            || ip_changed
+            || generation_changed;
         if !changed {
             return Ok(PeerRegistrationStage::Unchanged);
         }
 
         let mut updated_info = peer.info.clone();
         updated_info.ip = ip.to_owned();
+        if let Some(generation) = managed_generation {
+            updated_info.deployment_generation = generation;
+        }
         let serialized_info = serde_json::to_string(&updated_info)?;
         let rollback = PeerRegistrationRollback {
             socket_addr: peer.socket_addr,
@@ -1311,12 +1408,12 @@ impl RendezvousServer {
         if !allow_ip_request(&ip, &id).await {
             return Ok(Some(TOO_FREQUENT));
         }
-        let managed_authorized = if self.inner.allow_unmanaged_devices {
-            false
+        let managed_generation = if self.inner.allow_unmanaged_devices {
+            None
         } else {
             match self.verify_device_deployment(&id, &uuid, &pk).await {
-                Ok(true) => true,
-                Ok(false) => return Ok(Some(register_pk_response::Result::NOT_DEPLOYED)),
+                Ok(Some(generation)) => Some(generation),
+                Ok(None) => return Ok(Some(register_pk_response::Result::NOT_DEPLOYED)),
                 Err(err) => {
                     log::warn!("Device deployment verification failed for {}: {}", id, err);
                     return Ok(Some(register_pk_response::Result::SERVER_ERROR));
@@ -1336,7 +1433,7 @@ impl RendezvousServer {
                 &uuid,
                 &pk,
                 &ip,
-                managed_authorized,
+                managed_generation,
             )?
         };
         let pending = match stage {
@@ -1346,7 +1443,7 @@ impl RendezvousServer {
             PeerRegistrationStage::UuidMismatch => return Ok(Some(UUID_MISMATCH)),
             PeerRegistrationStage::TooFrequent => return Ok(Some(TOO_FREQUENT)),
             PeerRegistrationStage::Unchanged => {
-                if managed_authorized {
+                if managed_generation.is_some() {
                     peer.write().await.deployment_verified_at = Some(Instant::now());
                 }
                 return Ok(Some(register_pk_response::Result::OK));
@@ -1378,7 +1475,7 @@ impl RendezvousServer {
                 Ok(guid) => {
                     peer.guid = guid;
                     peer.persistence_in_progress = false;
-                    if managed_authorized {
+                    if managed_generation.is_some() {
                         peer.deployment_verified_at = Some(Instant::now());
                     }
                     Ok(())
@@ -1851,15 +1948,18 @@ impl RendezvousServer {
         id: &str,
         uuid: &[u8],
         public_key: &[u8],
-    ) -> ResultType<bool> {
+    ) -> ResultType<Option<u64>> {
         if self.inner.allow_unmanaged_devices {
-            return Ok(true);
+            return Ok(Some(0));
         }
         let base = self.inner.api_server.trim_end_matches('/');
         if base.is_empty() {
             bail!("API server is not configured");
         }
-        let public_key_hash = hex::encode(Sha256::digest(public_key));
+        let public_key_hash = sha256_hex(public_key);
+        let mut nonce = [0_u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let request_nonce = BASE64.encode(nonce);
         let response = self
             .inner
             .http_client
@@ -1869,13 +1969,27 @@ impl RendezvousServer {
                 "id": id,
                 "uuid": BASE64.encode(uuid),
                 "public_key_hash": public_key_hash,
+                "request_nonce": request_nonce,
             }))
             .send()
             .await?;
         match response.status().as_u16() {
-            204 => Ok(true),
+            200 => {
+                let assertion: DeploymentAssertion = response.json().await?;
+                let now = chrono::Utc::now().timestamp();
+                let generation = validate_deployment_assertion(
+                    &assertion,
+                    id,
+                    uuid,
+                    &public_key_hash,
+                    &request_nonce,
+                    &self.inner.device_verification_token,
+                    now,
+                )?;
+                Ok(Some(generation))
+            }
             401 | 403 => bail!("API rejected the rendezvous server credential"),
-            400 | 404 => Ok(false),
+            400 | 404 => Ok(None),
             status => bail!("API returned status {status}"),
         }
     }
@@ -3090,6 +3204,61 @@ mod tests {
     }
 
     #[test]
+    fn deployment_assertion_is_nonce_bound_signed_and_short_lived() {
+        let id = "device01";
+        let uuid = b"device-uuid";
+        let key_hash = sha256_hex(b"device-key");
+        let nonce = BASE64.encode([7_u8; 32]);
+        let secret = "management-verification-secret-with-32-bytes";
+        let now = 1_800_000_000_i64;
+        let expires_at = now + 30;
+        let generation = 7_u64;
+        let message = [
+            DEPLOYMENT_ASSERTION_VERSION,
+            id,
+            &BASE64.encode(uuid),
+            &key_hash,
+            &generation.to_string(),
+            &nonce,
+            &expires_at.to_string(),
+        ]
+        .join("\n");
+        let assertion = DeploymentAssertion {
+            version: 1,
+            deployment_generation: generation,
+            request_nonce: nonce.clone(),
+            expires_at,
+            assertion: BASE64.encode(hmac_sha256(secret.as_bytes(), message.as_bytes())),
+        };
+
+        assert_eq!(
+            validate_deployment_assertion(&assertion, id, uuid, &key_hash, &nonce, secret, now)
+                .unwrap(),
+            generation
+        );
+        assert!(validate_deployment_assertion(
+            &assertion,
+            id,
+            uuid,
+            &key_hash,
+            &BASE64.encode([8_u8; 32]),
+            secret,
+            now,
+        )
+        .is_err());
+        assert!(validate_deployment_assertion(
+            &assertion,
+            id,
+            uuid,
+            &key_hash,
+            &nonce,
+            secret,
+            expires_at + 1,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn peer_ids_are_bounded_and_canonical() {
         for id in ["123456", "device_01", "Device-01", "abcdefghijklmnop"] {
             assert!(RendezvousServer::valid_peer_id(id), "{id}");
@@ -3512,7 +3681,7 @@ mod tests {
             &first_uuid,
             &first_pk,
             "127.0.0.1",
-            false,
+            None,
         )?;
         assert!(matches!(first, PeerRegistrationStage::Persist(_)));
         assert!(peer.persistence_in_progress);
@@ -3526,7 +3695,7 @@ mod tests {
             &Bytes::from_static(b"competing-device"),
             &Bytes::from(vec![2; PEER_PUBLIC_KEY_LEN]),
             "127.0.0.2",
-            false,
+            None,
         )?;
         assert!(matches!(competing, PeerRegistrationStage::Busy));
         assert_eq!(peer.uuid, first_uuid);
@@ -3535,7 +3704,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_authorization_can_replace_stale_device_identity() -> ResultType<()> {
+    fn static_managed_authorization_cannot_replace_device_identity() -> ResultType<()> {
         let mut peer = Peer::default();
         peer.uuid = Bytes::from_static(b"old-device");
         peer.pk = Bytes::from(vec![1; PEER_PUBLIC_KEY_LEN]);
@@ -3549,11 +3718,35 @@ mod tests {
             &new_uuid,
             &new_pk,
             "127.0.0.2",
-            true,
+            Some(0),
+        )?;
+        assert!(matches!(stage, PeerRegistrationStage::UuidMismatch));
+        assert_eq!(peer.uuid, Bytes::from_static(b"old-device"));
+        assert_eq!(peer.pk, Bytes::from(vec![1; PEER_PUBLIC_KEY_LEN]));
+        Ok(())
+    }
+
+    #[test]
+    fn newer_managed_generation_can_replace_device_identity() -> ResultType<()> {
+        let mut peer = Peer::default();
+        peer.uuid = Bytes::from_static(b"old-device");
+        peer.pk = Bytes::from(vec![1; PEER_PUBLIC_KEY_LEN]);
+        peer.info.ip = "127.0.0.1".to_owned();
+        let new_uuid = Bytes::from_static(b"approved-device");
+        let new_pk = Bytes::from(vec![2; PEER_PUBLIC_KEY_LEN]);
+        let stage = RendezvousServer::stage_peer_registration(
+            &mut peer,
+            "device01",
+            SocketAddr::from(([127, 0, 0, 2], 21116)),
+            &new_uuid,
+            &new_pk,
+            "127.0.0.2",
+            Some(1),
         )?;
         assert!(matches!(stage, PeerRegistrationStage::Persist(_)));
         assert_eq!(peer.uuid, new_uuid);
         assert_eq!(peer.pk, new_pk);
+        assert_eq!(peer.info.deployment_generation, 1);
         Ok(())
     }
 

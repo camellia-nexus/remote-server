@@ -19,8 +19,8 @@ Both long-lived binaries accept command-line flags and canonical environment var
 | `CAMELLIA_REMOTE_RELAY_SERVERS` | empty | comma-separated public relay hosts |
 | `CAMELLIA_REMOTE_API_SERVER` | loopback port 21114 | canonical HTTP(S) management origin |
 | `CAMELLIA_REMOTE_DB_URL` | `./camellia-remote.sqlite3` | identity SQLite state path |
-| `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE` | empty | bounded, non-symlink regular file containing the shared API secret |
-| `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN` | empty | direct secret alternative; never set together with the file variable |
+| `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE` | empty | bounded, non-symlink regular file containing the shared API authentication and deployment-assertion HMAC secret |
+| `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN` | empty | direct secret alternative used for the same assertion contract; never set together with the file variable |
 | `CAMELLIA_REMOTE_ALWAYS_USE_RELAY` | `N` | disable direct connections when `Y` |
 | `CAMELLIA_REMOTE_ALLOW_UNMANAGED_DEVICES` | `N` | emergency/development bypass; must remain `N` in managed production |
 | `CAMELLIA_REMOTE_MAX_DATABASE_CONNECTIONS` | implementation default | bounded SQLite connection pool |

@@ -47,11 +47,13 @@ Important settings:
 - `CAMELLIA_REMOTE_RELAY_PORT`: relay base port, default 21117.
 - `CAMELLIA_REMOTE_RELAY_SERVERS`: public relay `host:port` values advertised to clients.
 - `CAMELLIA_REMOTE_API_SERVER`: bare management API origin. Non-loopback HTTP is rejected.
-- `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE`: shared high-entropy verification secret.
+- `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE`: shared high-entropy verification secret used both to authenticate deployment checks and to verify their HMAC-SHA256 assertions.
 - `CAMELLIA_REMOTE_TRUST_PROXY_HEADERS`: keep `N` unless a trusted proxy overwrites client
   address headers.
 - `CAMELLIA_REMOTE_DB_URL`: identity SQLite path. The clean default is
   `./camellia-remote.sqlite3`.
+
+Managed registration uses the breaking `camellia-deployment-assertion-v1` contract. Identity sends a fresh random 32-byte nonce with every deployment check and accepts only a version-1 JSON assertion bound to that nonce, the rid, UUID, public-key hash, deployment generation, and an expiry no more than 60 seconds in the future. Static 204 responses are rejected. The generation is stored with peer metadata; the same or an older generation cannot replace a persisted UUID/public key, while a strictly newer Management-approved generation can. Upgrade Management and Server together and preserve the SQLite identity state across restarts.
 
 See [the complete environment reference](docs/environment-variables.md).
 
