@@ -174,6 +174,7 @@ pub(crate) struct Peer {
     pub(crate) pk: Bytes,
     pub(crate) persistence_in_progress: bool,
     pub(crate) deployment_verified_at: Option<Instant>,
+    pub(crate) deployment_verification_sequence: u64,
     // pub(crate) user: Option<Vec<u8>>,
     pub(crate) info: PeerInfo,
     // pub(crate) disabled: bool,
@@ -191,11 +192,31 @@ impl Default for Peer {
             pk: Bytes::new(),
             persistence_in_progress: false,
             deployment_verified_at: None,
+            deployment_verification_sequence: 0,
             info: Default::default(),
             // user: None,
             // disabled: false,
             reg_pk: (0, get_expired_time()),
         }
+    }
+}
+
+impl Peer {
+    pub(crate) fn apply_managed_verification(&mut self, sequence: u64) -> bool {
+        if sequence <= self.deployment_verification_sequence {
+            return false;
+        }
+        self.deployment_verification_sequence = sequence;
+        true
+    }
+
+    pub(crate) fn revoke_managed_registration(&mut self, sequence: u64) {
+        if sequence > self.deployment_verification_sequence {
+            self.deployment_verification_sequence = sequence;
+        }
+        self.socket_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        self.last_reg_time = get_expired_time();
+        self.deployment_verified_at = None;
     }
 }
 

@@ -37,7 +37,7 @@ use serde_derive::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -72,7 +72,8 @@ const RENDEZVOUS_TOKEN_LEN: usize = 32;
 const RELAY_SERVER_NAME_MAX_LEN: usize = 512;
 const PEER_CACHE_CLEANUP_INTERVAL_SECS: u64 = 300;
 const PEER_CACHE_IDLE_SECS: u64 = 600;
-const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 30;
+const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 15;
+const _: () = assert!(DEPLOYMENT_VERIFICATION_CACHE_SECS <= 15);
 const DEPLOYMENT_ASSERTION_VERSION: &str = "camellia-deployment-assertion-v1";
 const DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS: i64 = 60;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
@@ -294,6 +295,16 @@ fn consume_pending_rendezvous_in(
     pending.remove(token);
     Ok(consumed)
 }
+
+fn revoke_pending_rendezvous_in(
+    pending: &mut HashMap<Bytes, PendingRendezvous>,
+    responder_id: &str,
+) -> usize {
+    let before = pending.len();
+    pending.retain(|_, entry| entry.responder_id != responder_id);
+    before - pending.len()
+}
+
 static PUNCH_REQS: Lazy<TokioMutex<VecDeque<PunchReqEntry>>> =
     Lazy::new(|| TokioMutex::new(VecDeque::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
@@ -441,6 +452,7 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     connection_slots: Arc<Semaphore>,
+    deployment_verification_sequence: Arc<AtomicU64>,
 }
 
 enum LoopFailure {
@@ -459,6 +471,16 @@ struct RendezvousListeners {
 }
 
 impl RendezvousServer {
+    fn next_deployment_verification_sequence(&self) -> u64 {
+        match self.deployment_verification_sequence.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |sequence| sequence.checked_add(1),
+        ) {
+            Ok(sequence) | Err(sequence) => sequence,
+        }
+    }
+
     fn valid_peer_id(id: &str) -> bool {
         (PEER_ID_MIN_LEN..=PEER_ID_MAX_LEN).contains(&id.len())
             && id
@@ -740,6 +762,7 @@ impl RendezvousServer {
             relay_servers0: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
             connection_slots: Arc::new(Semaphore::new(max_connections)),
+            deployment_verification_sequence: Arc::new(AtomicU64::new(1)),
             inner: Arc::new(Inner {
                 serial,
                 api_server,
@@ -1408,24 +1431,40 @@ impl RendezvousServer {
         if !allow_ip_request(&ip, &id).await {
             return Ok(Some(TOO_FREQUENT));
         }
-        let managed_generation = if self.inner.allow_unmanaged_devices {
+        let managed_verification = if self.inner.allow_unmanaged_devices {
             None
         } else {
+            let sequence = self.next_deployment_verification_sequence();
             match self.verify_device_deployment(&id, &uuid, &pk).await {
-                Ok(Some(generation)) => Some(generation),
-                Ok(None) => return Ok(Some(register_pk_response::Result::NOT_DEPLOYED)),
+                Ok(Some(generation)) => Some((generation, sequence)),
+                Ok(None) => {
+                    // Allocate a barrier when the authoritative revocation is
+                    // observed, not only when this request started. This makes
+                    // every verification already in flight stale; only a new
+                    // request initiated after the 404 may bring the peer back.
+                    let revocation_sequence = self.next_deployment_verification_sequence();
+                    self.revoke_managed_registration(&id, revocation_sequence)
+                        .await;
+                    return Ok(Some(register_pk_response::Result::NOT_DEPLOYED));
+                }
                 Err(err) => {
                     log::warn!("Device deployment verification failed for {}: {}", id, err);
                     return Ok(Some(register_pk_response::Result::SERVER_ERROR));
                 }
             }
         };
+        let managed_generation = managed_verification.map(|(generation, _)| generation);
 
         let Some(peer) = self.pm.get_or(&id).await? else {
             return Ok(Some(register_pk_response::Result::SERVER_ERROR));
         };
         let stage = {
             let mut peer = peer.write().await;
+            if let Some((_, sequence)) = managed_verification {
+                if !peer.apply_managed_verification(sequence) {
+                    return Ok(Some(register_pk_response::Result::SERVER_ERROR));
+                }
+            }
             Self::stage_peer_registration(
                 &mut peer,
                 &id,
@@ -1443,8 +1482,12 @@ impl RendezvousServer {
             PeerRegistrationStage::UuidMismatch => return Ok(Some(UUID_MISMATCH)),
             PeerRegistrationStage::TooFrequent => return Ok(Some(TOO_FREQUENT)),
             PeerRegistrationStage::Unchanged => {
-                if managed_generation.is_some() {
-                    peer.write().await.deployment_verified_at = Some(Instant::now());
+                if let Some((_, sequence)) = managed_verification {
+                    let mut peer = peer.write().await;
+                    if peer.deployment_verification_sequence != sequence {
+                        return Ok(Some(register_pk_response::Result::SERVER_ERROR));
+                    }
+                    peer.deployment_verified_at = Some(Instant::now());
                 }
                 return Ok(Some(register_pk_response::Result::OK));
             }
@@ -1460,6 +1503,7 @@ impl RendezvousServer {
         let database = self.pm.db.clone();
         let persisted_peer = peer.clone();
         let persisted_id = id.clone();
+        let verification_sequence = managed_verification.map(|(_, sequence)| sequence);
         let persistence = tokio::spawn(async move {
             let result = if guid.is_empty() {
                 database.insert_peer(&persisted_id, &uuid, &pk, &info).await
@@ -1475,25 +1519,47 @@ impl RendezvousServer {
                 Ok(guid) => {
                     peer.guid = guid;
                     peer.persistence_in_progress = false;
-                    if managed_generation.is_some() {
-                        peer.deployment_verified_at = Some(Instant::now());
-                    }
-                    Ok(())
+                    let verification_is_current = if let Some(sequence) = verification_sequence {
+                        if peer.deployment_verification_sequence != sequence {
+                            peer.socket_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                            peer.last_reg_time = get_expired_time();
+                            peer.deployment_verified_at = None;
+                            false
+                        } else {
+                            peer.deployment_verified_at = Some(Instant::now());
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    Ok(verification_is_current)
                 }
                 Err(err) => {
-                    peer.socket_addr = rollback.socket_addr;
-                    peer.last_reg_time = rollback.last_reg_time;
                     peer.uuid = rollback.uuid;
                     peer.pk = rollback.pk;
                     peer.info = rollback.info;
-                    peer.deployment_verified_at = rollback.deployment_verified_at;
+                    if verification_sequence
+                        .is_some_and(|sequence| peer.deployment_verification_sequence != sequence)
+                    {
+                        peer.socket_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                        peer.last_reg_time = get_expired_time();
+                        peer.deployment_verified_at = None;
+                    } else {
+                        peer.socket_addr = rollback.socket_addr;
+                        peer.last_reg_time = rollback.last_reg_time;
+                        peer.deployment_verified_at = rollback.deployment_verified_at;
+                    }
                     peer.persistence_in_progress = false;
                     Err(err)
                 }
             }
         });
         match persistence.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                log::warn!("Discarded stale deployment verification result for {}", id);
+                return Ok(Some(register_pk_response::Result::SERVER_ERROR));
+            }
             Ok(Err(err)) => {
                 log::error!("Failed to persist peer {}: {}", id, err);
                 return Ok(Some(register_pk_response::Result::SERVER_ERROR));
@@ -1509,6 +1575,17 @@ impl RendezvousServer {
         }
 
         Ok(Some(register_pk_response::Result::OK))
+    }
+
+    async fn revoke_managed_registration(&self, id: &str, sequence: u64) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            peer.write().await.revoke_managed_registration(sequence);
+        }
+        // Pending rendezvous authorization is independent of peer-cache
+        // residency. An evicted responder must not retain a usable token after
+        // Management has returned an authoritative 404.
+        let mut pending = self.pending_rendezvous.lock().await;
+        revoke_pending_rendezvous_in(&mut pending, id);
     }
 
     #[inline]
@@ -3201,6 +3278,69 @@ mod tests {
         assert!(RendezvousServer::decode_session_key(&exchange, &secret).is_err());
         exchange.keys.clear();
         assert!(RendezvousServer::decode_session_key(&exchange, &secret).is_err());
+    }
+
+    #[test]
+    fn revoked_managed_registration_is_offline_without_erasing_identity() {
+        let mut peer = Peer::default();
+        peer.socket_addr = SocketAddr::from(([192, 0, 2, 20], 21116));
+        peer.last_reg_time = Instant::now();
+        peer.uuid = Bytes::from_static(b"managed-device");
+        peer.pk = Bytes::from(vec![4; PEER_PUBLIC_KEY_LEN]);
+        peer.deployment_verified_at = Some(Instant::now());
+
+        assert!(peer.apply_managed_verification(2));
+        peer.revoke_managed_registration(3);
+
+        assert_eq!(peer.socket_addr.port(), 0);
+        assert!(peer.last_reg_time.elapsed().as_millis() >= REG_TIMEOUT as u128);
+        assert!(peer.deployment_verified_at.is_none());
+        assert_eq!(peer.uuid, Bytes::from_static(b"managed-device"));
+        assert_eq!(peer.pk, Bytes::from(vec![4; PEER_PUBLIC_KEY_LEN]));
+        assert_eq!(peer.deployment_verification_sequence, 3);
+        assert!(!peer.apply_managed_verification(2));
+        assert!(peer.apply_managed_verification(4));
+    }
+
+    #[test]
+    fn explicit_revocation_clears_only_matching_pending_rendezvous() {
+        let now = Instant::now();
+        let requester = SocketAddr::from(([192, 0, 2, 30], 21116));
+        let mut pending = HashMap::from([
+            (
+                Bytes::from(vec![1; RENDEZVOUS_TOKEN_LEN]),
+                PendingRendezvous {
+                    requester,
+                    responder_id: "revoked-device".to_owned(),
+                    allowed_results: PendingRendezvousResults::DirectOrRelay,
+                    relay_server: "relay.example.test".to_owned(),
+                    created_at: now,
+                },
+            ),
+            (
+                Bytes::from(vec![2; RENDEZVOUS_TOKEN_LEN]),
+                PendingRendezvous {
+                    requester,
+                    responder_id: "active-device".to_owned(),
+                    allowed_results: PendingRendezvousResults::RelayOnly,
+                    relay_server: "relay.example.test".to_owned(),
+                    created_at: now,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            revoke_pending_rendezvous_in(&mut pending, "revoked-device"),
+            1
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending
+                .values()
+                .next()
+                .map(|entry| entry.responder_id.as_str()),
+            Some("active-device")
+        );
     }
 
     #[test]
