@@ -43,53 +43,15 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features
       - name: Test
         run: cargo test --locked --workspace --all-features
-
-  publish:
-    name: Publish to GHCR
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-    needs: [quality]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Extract metadata
-        id: meta
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          image="ghcr.io/${{ github.repository_owner }}/remote-server"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: true
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            REVISION=${{ github.sha }}
-            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
-          tags: |
-            ${{ steps.meta.outputs.image }}:latest
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
-            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+      - name: Validate release metadata
+        run: python3 scripts/test_release_metadata.py
+      - name: Validate Compose model
+        env:
+          CAMELLIA_REMOTE_API_SERVER: https://api.example.com
+          CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE: /tmp/device-verification-token
+          CAMELLIA_REMOTE_RELAY_ADDRESS: relay.example.com:21117
+          CAMELLIA_REMOTE_SERVER_IMAGE: ghcr.io/example/remote-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        run: docker compose config --quiet
 
   required:
     name: CI / Required
