@@ -337,6 +337,123 @@ pub(crate) fn read_bounded_regular_file(
 }
 
 #[allow(dead_code)]
+pub(crate) fn read_bounded_secret_file(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> ResultType<Vec<u8>> {
+    let symlink_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Unable to inspect {label}: {}", path.display()))?;
+    if symlink_metadata.file_type().is_symlink() {
+        camellia_remote_protocol::bail!(
+            "{label} path must not be a symbolic link: {}",
+            path.display()
+        );
+    }
+    if !symlink_metadata.is_file() {
+        camellia_remote_protocol::bail!("{label} path is not a regular file: {}", path.display());
+    }
+
+    let mut file = open_readonly_no_follow(path)
+        .with_context(|| format!("Unable to open {label}: {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Unable to inspect {label}: {}", path.display()))?;
+    if !metadata.is_file() {
+        camellia_remote_protocol::bail!("{label} path is not a regular file: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if symlink_metadata.dev() != metadata.dev() || symlink_metadata.ino() != metadata.ino() {
+            camellia_remote_protocol::bail!("{label} changed while opening: {}", path.display());
+        }
+
+        let nlink = metadata.nlink();
+        if nlink != 1 {
+            camellia_remote_protocol::bail!(
+                "{label} must have exactly one link (link count: {}): {}",
+                nlink,
+                path.display()
+            );
+        }
+
+        let file_uid = metadata.uid();
+        let current_euid = unsafe { libc::geteuid() };
+        if file_uid != 0 && file_uid != current_euid {
+            camellia_remote_protocol::bail!(
+                "{label} must be owned by root or running UID: {} (file UID: {}, current UID: {})",
+                path.display(),
+                file_uid,
+                current_euid
+            );
+        }
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            camellia_remote_protocol::bail!(
+                "{label} has insecure permissions: {} (mode: {:04o}, must not permit group or other access)",
+                path.display(),
+                mode & 0o7777
+            );
+        }
+
+        let parent = parent_directory(path);
+        let parent_metadata = fs::symlink_metadata(parent).with_context(|| {
+            format!(
+                "Unable to inspect {label} parent directory: {}",
+                parent.display()
+            )
+        })?;
+        if parent_metadata.file_type().is_symlink() {
+            camellia_remote_protocol::bail!(
+                "{label} parent directory must not be a symbolic link: {}",
+                parent.display()
+            );
+        }
+        if !parent_metadata.is_dir() {
+            camellia_remote_protocol::bail!(
+                "{label} parent path is not a directory: {}",
+                parent.display()
+            );
+        }
+        let parent_uid = parent_metadata.uid();
+        if parent_uid != 0 && parent_uid != current_euid {
+            camellia_remote_protocol::bail!(
+                "{label} parent directory must be owned by root or running UID: {} (parent UID: {}, current UID: {})",
+                parent.display(),
+                parent_uid,
+                current_euid
+            );
+        }
+        let parent_mode = parent_metadata.permissions().mode();
+        if parent_mode & 0o022 != 0 {
+            camellia_remote_protocol::bail!(
+                "{label} parent directory must not be group- or world-writable: {} (mode: {:04o})",
+                parent.display(),
+                parent_mode & 0o7777
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if let Some(links) = metadata.number_of_links() {
+            if links > 1 {
+                camellia_remote_protocol::bail!(
+                    "{label} must not have hard links (hard link count: {links}): {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    read_bounded_open_file(&mut file, path, max_bytes, label)
+}
+
+#[allow(dead_code)]
 pub fn load_arg_file_if_present(path: &Path) -> ResultType<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => load_arg_file(path),
@@ -670,7 +787,7 @@ pub async fn listen_signal() -> Result<()> {
     unreachable!();
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // The tokio::test macro expands to unqualified `tokio` paths.
     use camellia_remote_protocol::tokio;
@@ -679,26 +796,36 @@ mod tests {
         path::PathBuf,
     };
 
-    struct TestDirectory(PathBuf);
+    pub(crate) struct TestDirectory(pub(crate) PathBuf);
 
     impl TestDirectory {
-        fn new(label: &str) -> Self {
+        pub(crate) fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "camellia-server-{label}-{}-{}",
                 std::process::id(),
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+            }
             Self(path)
         }
 
-        fn secret_path(&self) -> PathBuf {
+        pub(crate) fn secret_path(&self) -> PathBuf {
             self.0.join("id_ed25519")
         }
     }
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
             let _ = fs::remove_dir_all(&self.0);
         }
     }
@@ -1030,5 +1157,175 @@ mod tests {
         symlink(&victim, &public_path).unwrap();
         assert!(load_or_create_keypair(&secret_path, 0).is_err());
         assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn secret_file_accepts_mode_0600_and_0400() {
+        let directory = TestDirectory::new("secret-valid");
+        let token_path = directory.0.join("token");
+        fs::write(&token_path, "canonical-verification-secret-12345\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let contents = read_bounded_secret_file(&token_path, 4096, "Token").unwrap();
+            assert_eq!(contents, b"canonical-verification-secret-12345\n");
+
+            fs::set_permissions(&token_path, fs::Permissions::from_mode(0o400)).unwrap();
+            let contents = read_bounded_secret_file(&token_path, 4096, "Token").unwrap();
+            assert_eq!(contents, b"canonical-verification-secret-12345\n");
+        }
+        #[cfg(not(unix))]
+        {
+            let contents = read_bounded_secret_file(&token_path, 4096, "Token").unwrap();
+            assert_eq!(contents, b"canonical-verification-secret-12345\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_rejects_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TestDirectory::new("secret-insecure-perms");
+        let token_path = directory.0.join("token");
+        fs::write(&token_path, "secret-data").unwrap();
+
+        for mode in [0o644, 0o660, 0o777, 0o640, 0o604, 0o602, 0o601] {
+            fs::set_permissions(&token_path, fs::Permissions::from_mode(mode)).unwrap();
+            let result = read_bounded_secret_file(&token_path, 4096, "Token");
+            assert!(
+                result.is_err(),
+                "Mode {:04o} should have been rejected",
+                mode
+            );
+            let err_msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                err_msg.contains("insecure permissions"),
+                "Mode {:04o} error did not mention insecure permissions: {}",
+                mode,
+                err_msg
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_rejects_symbolic_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = TestDirectory::new("secret-symlink");
+        let target_path = directory.0.join("real_token");
+        fs::write(&target_path, "real-secret-token").unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link_path = directory.0.join("symlink_token");
+        symlink(&target_path, &link_path).unwrap();
+
+        let result = read_bounded_secret_file(&link_path, 4096, "Token");
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("symbolic link")
+                || err_msg.contains("Too many levels of symbolic links"),
+            "Error did not mention symbolic link: {}",
+            err_msg
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_rejects_hard_links() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TestDirectory::new("secret-hardlink");
+        let target_path = directory.0.join("real_token");
+        fs::write(&target_path, "real-secret-token").unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link_path = directory.0.join("hardlink_token");
+        fs::hard_link(&target_path, &link_path).unwrap();
+
+        let result1 = read_bounded_secret_file(&target_path, 4096, "Token");
+        assert!(result1.is_err());
+        let err1 = format!("{:#}", result1.unwrap_err());
+        assert!(
+            err1.contains("hard links") || err1.contains("exactly one link"),
+            "Error did not mention link count: {}",
+            err1
+        );
+
+        let result2 = read_bounded_secret_file(&link_path, 4096, "Token");
+        assert!(result2.is_err());
+        let err2 = format!("{:#}", result2.unwrap_err());
+        assert!(
+            err2.contains("hard links") || err2.contains("exactly one link"),
+            "Error did not mention link count: {}",
+            err2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_rejects_writable_parent_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent_dir = TestDirectory::new("secret-writable-parent");
+        let child_dir = parent_dir.0.join("insecure_dir");
+        fs::create_dir(&child_dir).unwrap();
+        fs::set_permissions(&child_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let token_path = child_dir.join("token");
+        fs::write(&token_path, "secret-data").unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let result = read_bounded_secret_file(&token_path, 4096, "Token");
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("parent directory must not be group- or world-writable"),
+            "Error did not mention parent directory writable: {}",
+            err_msg
+        );
+
+        // Test group-writable parent (0775)
+        fs::set_permissions(&child_dir, fs::Permissions::from_mode(0o775)).unwrap();
+        let result_group = read_bounded_secret_file(&token_path, 4096, "Token");
+        assert!(result_group.is_err());
+
+        // Restore to 0700: should succeed
+        fs::set_permissions(&child_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_bounded_secret_file(&token_path, 4096, "Token").is_ok());
+    }
+
+    #[test]
+    fn secret_file_fails_closed_without_leaking_contents() {
+        let directory = TestDirectory::new("secret-no-leak");
+        let token_path = directory.0.join("token");
+        let canary_secret = "CANARY_TOKEN_NEVER_LEAK_INTO_ERROR_OUTPUT_1234567890";
+        fs::write(&token_path, format!("{canary_secret}\n")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&token_path, fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let result = read_bounded_secret_file(&token_path, 4096, "Verification token");
+        #[cfg(unix)]
+        {
+            assert!(result.is_err());
+            let err_msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                !err_msg.contains(canary_secret),
+                "Error message leaked secret contents: {}",
+                err_msg
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = result;
+        }
     }
 }

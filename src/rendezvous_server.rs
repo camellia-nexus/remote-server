@@ -343,25 +343,30 @@ impl RendezvousServer {
         request.controlled_context = Default::default();
     }
 
-    fn device_verification_token() -> ResultType<String> {
+    pub(crate) fn device_verification_token() -> ResultType<String> {
         let direct = std::env::var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN")
             .ok()
             .filter(|value| !value.is_empty());
-        let file = get_arg_opt("device-verification-token-file").filter(|value| !value.is_empty());
+        let file =
+            get_arg_opt("device-verification-token-file").filter(|value| !value.trim().is_empty());
         if direct.is_some() && file.is_some() {
             bail!(
                 "Set only one of CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN or CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE"
             );
         }
         if let Some(path) = file {
-            let value = crate::common::read_bounded_regular_file(
+            let value = crate::common::read_bounded_secret_file(
                 std::path::Path::new(&path),
                 4_096,
                 "CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE",
             )?;
             let value = std::str::from_utf8(&value)
                 .context("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE must be UTF-8")?;
-            return Ok(value.trim().to_owned());
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                bail!("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE must not be empty");
+            }
+            return Ok(trimmed.to_owned());
         }
         Ok(direct.unwrap_or_default())
     }
@@ -1506,7 +1511,7 @@ impl RendezvousServer {
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
                 if peer_is_lan {
-                    // https://github.com/rustdesk/rustdesk-server/issues/24
+                    // Route peer traffic via local IP when peer is within LAN
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
@@ -2460,7 +2465,7 @@ impl RendezvousServer {
                     // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
                     // and corrupting logged addresses. Enable it only when the WebSocket
                     // port is reachable exclusively through a reverse proxy that overwrites
-                    // them. https://github.com/rustdesk/rustdesk-server/issues/634
+                    // them (upstream reference: reverse-proxy WebSocket IP forwarding).
                     let headers = req.headers();
                     let real_ip = headers
                         .get("X-Real-IP")
@@ -3314,5 +3319,137 @@ mod tests {
     fn rendezvous_control_frame_ceiling_is_strictly_reduced() {
         // RES-006: Reduced from 17 MiB to 1 MiB to prevent 68 GiB theoretical memory amplification
         assert_eq!(RENDEZVOUS_CONTROL_FRAME_MAX, 1024 * 1024);
+    }
+
+    static DEVICE_VERIFICATION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn device_verification_token_file_accepts_secure_file() {
+        let _guard = DEVICE_VERIFICATION_ENV_LOCK.lock().unwrap();
+
+        let directory = crate::common::tests::TestDirectory::new("dev-token-valid");
+        let token_path = directory.0.join("device_token");
+        let expected_token = "0123456789abcdef0123456789abcdef"; // 32 chars
+        std::fs::write(&token_path, format!("{expected_token}\n")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN");
+        crate::common::set_arg(
+            "device-verification-token-file",
+            token_path.to_str().unwrap(),
+        );
+
+        let loaded = RendezvousServer::device_verification_token().unwrap();
+        assert_eq!(loaded, expected_token);
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_verification_token_file_rejects_insecure_file() {
+        let _guard = DEVICE_VERIFICATION_ENV_LOCK.lock().unwrap();
+
+        let directory = crate::common::tests::TestDirectory::new("dev-token-insecure");
+        let token_path = directory.0.join("device_token");
+        std::fs::write(&token_path, "0123456789abcdef0123456789abcdef\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN");
+        crate::common::set_arg(
+            "device-verification-token-file",
+            token_path.to_str().unwrap(),
+        );
+
+        let result = RendezvousServer::device_verification_token();
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("insecure permissions"),
+            "Error: {}",
+            err_msg
+        );
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_verification_token_file_rejects_symlink() {
+        let _guard = DEVICE_VERIFICATION_ENV_LOCK.lock().unwrap();
+
+        let directory = crate::common::tests::TestDirectory::new("dev-token-symlink");
+        let target_path = directory.0.join("real_token");
+        std::fs::write(&target_path, "0123456789abcdef0123456789abcdef\n").unwrap();
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link_path = directory.0.join("symlink_token");
+        symlink(&target_path, &link_path).unwrap();
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN");
+        crate::common::set_arg(
+            "device-verification-token-file",
+            link_path.to_str().unwrap(),
+        );
+
+        let result = RendezvousServer::device_verification_token();
+        assert!(result.is_err());
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE");
+    }
+
+    #[test]
+    fn device_verification_token_rejects_conflicting_direct_and_file() {
+        let _guard = DEVICE_VERIFICATION_ENV_LOCK.lock().unwrap();
+
+        std::env::set_var(
+            "CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN",
+            "direct_token_12345",
+        );
+        crate::common::set_arg("device-verification-token-file", "/path/to/some/token");
+
+        let result = RendezvousServer::device_verification_token();
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(err_msg.contains("Set only one"));
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN");
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE");
+    }
+
+    #[test]
+    fn device_verification_token_file_rejects_empty_file() {
+        let _guard = DEVICE_VERIFICATION_ENV_LOCK.lock().unwrap();
+
+        let directory = crate::common::tests::TestDirectory::new("dev-token-empty");
+        let token_path = directory.0.join("empty_token");
+        std::fs::write(&token_path, "   \n\t  \n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN");
+        crate::common::set_arg(
+            "device-verification-token-file",
+            token_path.to_str().unwrap(),
+        );
+
+        let result = RendezvousServer::device_verification_token();
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(err_msg.contains("must not be empty"), "Error: {}", err_msg);
+
+        std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE");
     }
 }
