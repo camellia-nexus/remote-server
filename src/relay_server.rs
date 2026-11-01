@@ -1,3 +1,4 @@
+use crate::common::TrustedProxyConfig;
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -151,8 +152,9 @@ pub async fn pending_endpoints() -> usize {
 struct RelayContext {
     limiter: Limiter,
     key: Arc<str>,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
     runtime_console: bool,
+    console_token: Option<Arc<str>>,
     connection_slots: Arc<Semaphore>,
     memory_budget: Arc<crate::common::MemoryBudget>,
 }
@@ -252,14 +254,22 @@ pub async fn start_with_bind(
     bind_addr: Option<IpAddr>,
     port: &str,
     key: &str,
-    trust_proxy_headers: bool,
+    trusted_proxies: TrustedProxyConfig,
 ) -> ResultType<()> {
     let key = get_server_sk(key)?;
     let runtime_console = crate::common::get_yes_no_arg("ENABLE_RUNTIME_CONSOLE", false)?;
-    if runtime_console {
-        log::warn!("Unauthenticated loopback runtime console is enabled");
-    }
-    log::info!("trust_proxy_headers: {}", trust_proxy_headers);
+    let console_token = if runtime_console {
+        let token = crate::common::runtime_console_token()?;
+        log::info!("Authenticated loopback runtime console is enabled");
+        Some(Arc::from(token))
+    } else {
+        None
+    };
+    log::info!(
+        "trusted_proxy_headers: {}, trusted_proxy_cidrs: {}",
+        trusted_proxies.is_enabled(),
+        trusted_proxies.network_count()
+    );
     *BLACKLIST.write().await = load_ip_list(BLACKLIST_FILE)?;
     log::info!(
         "#blacklist({}): {}",
@@ -297,8 +307,9 @@ pub async fn start_with_bind(
     let context = RelayContext {
         limiter: <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _),
         key: Arc::from(key.as_str()),
-        trust_proxy_headers,
+        trusted_proxies,
         runtime_console,
+        console_token,
         connection_slots,
         memory_budget,
     };
@@ -780,13 +791,17 @@ async fn io_loop(
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, context: &RelayContext) {
     let Ok(permit) = context.connection_slots.clone().try_acquire_owned() else {
-        log::warn!("Relay connection limit reached; rejected {}", addr);
+        log::warn!(
+            "Relay connection limit reached; rejected {}",
+            crate::common::mask_socket_addr(addr)
+        );
         return;
     };
     let socket_guard = AcceptedSocketGuard::new();
     let ip = camellia_remote_protocol::try_into_v4(addr).ip();
     if context.runtime_console && !ws && ip.is_loopback() {
         let limiter = context.limiter.clone();
+        let console_token = context.console_token.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _socket_guard = socket_guard;
@@ -794,15 +809,33 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
             let mut buffer = [0; 1024];
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                 if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
-                    let res = check_cmd(data, limiter).await;
-                    stream.write_all(res.as_bytes()).await.ok();
+                    let expected_token = console_token.as_deref().unwrap_or_default();
+                    if let Some(cmd) = crate::common::verify_console_auth(data, expected_token) {
+                        let res = if cmd.is_empty() {
+                            "Authenticated\n".to_owned()
+                        } else {
+                            check_cmd(cmd, limiter).await
+                        };
+                        stream.write_all(res.as_bytes()).await.ok();
+                    } else {
+                        log::warn!(
+                            "Unauthorized relay runtime console access attempt from {}",
+                            crate::common::mask_socket_addr(addr)
+                        );
+                        stream
+                            .write_all(
+                                b"Unauthorized: invalid or missing console authentication token\n",
+                            )
+                            .await
+                            .ok();
+                    }
                 }
             }
         });
         return;
     }
     if is_ip_in_set(&*BLOCKLIST.read().await, ip) {
-        log::info!("{} blocked", ip);
+        log::info!("{} blocked", crate::common::mask_ip(ip));
         return;
     }
     let context = context.clone();
@@ -824,33 +857,31 @@ async fn make_pair(
     socket_guard: AcceptedSocketGuard,
 ) -> ResultType<()> {
     if ws {
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-        let trust_proxy_headers = context.trust_proxy_headers;
+        use tokio_tungstenite::tungstenite::{
+            handshake::server::{ErrorResponse, Request, Response},
+            http::StatusCode,
+        };
+        let trusted_proxies = context.trusted_proxies.clone();
         let callback = move |req: &Request, response: Response| {
-            if trust_proxy_headers {
-                // Only consulted when the operator opts in with --trust-proxy-headers.
-                // These headers are NOT verifiable: anyone able to reach this port
-                // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
-                // and corrupting logged addresses. Enable it only when the WebSocket
-                // port is reachable exclusively through a reverse proxy that overwrites
-                // them. Reference upstream issue #634.
-                let headers = req.headers();
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok())
-                    .and_then(|value| value.split(',').next())
-                    .map(|value| value.trim())
-                    .filter(|value| !value.is_empty());
-                if let Some(ip) = real_ip {
-                    if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
-                        // Keep the accepted TCP source port so concurrent websocket
-                        // clients behind one public IP stay distinguishable.
-                        addr = SocketAddr::new(real_ip_addr, addr.port());
-                    }
+            match trusted_proxies.resolve_client_ip(addr.ip(), req.headers()) {
+                Ok(client_ip) => {
+                    // Keep the accepted TCP source port so concurrent WebSocket
+                    // clients behind one public IP stay distinguishable.
+                    addr.set_ip(client_ip);
+                    Ok(response)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Rejected relay WebSocket proxy headers from {}: {}",
+                        crate::common::mask_socket_addr(addr),
+                        err
+                    );
+                    let mut error =
+                        ErrorResponse::new(Some("Invalid proxy client address headers".to_owned()));
+                    *error.status_mut() = StatusCode::BAD_REQUEST;
+                    Err(error)
                 }
             }
-            Ok(response)
         };
         let websocket_config = tungstenite::protocol::WebSocketConfig::default()
             .read_buffer_size(32 * 1024)
@@ -872,7 +903,10 @@ async fn make_pair(
             Err(_) => bail!("Relay WebSocket upgrade timed out"),
         };
         if is_ip_in_set(&*BLOCKLIST.read().await, addr.ip()) {
-            log::info!("{} blocked after websocket upgrade", addr.ip());
+            log::info!(
+                "{} blocked after websocket upgrade",
+                crate::common::mask_ip(addr.ip())
+            );
             return Ok(());
         }
         make_pair_(ws_stream, addr, &context, permit, socket_guard).await;
@@ -894,13 +928,19 @@ async fn make_pair_(
     let mut stream = stream;
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         let Some(_frame_permit) = context.memory_budget.try_acquire(bytes.len()) else {
-            log::warn!("Relay memory budget exceeded for handshake from {}", addr);
+            log::warn!(
+                "Relay memory budget exceeded for handshake from {}",
+                crate::common::mask_socket_addr(addr)
+            );
             return;
         };
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !context.key.is_empty() && rf.licence_key != *context.key {
-                    log::warn!("Relay authentication failed from {} - invalid key", addr);
+                    log::warn!(
+                        "Relay authentication failed from {} - invalid key",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     return;
                 }
                 if valid_relay_uuid(&rf.uuid) && rf.licence_key.len() <= 128 {
@@ -918,12 +958,16 @@ async fn make_pair_(
                             {
                                 log::warn!(
                                     "Relay pending limit reached; rejected {} from {}",
-                                    rf.uuid,
-                                    addr
+                                    crate::common::pseudonymize_uuid(&rf.uuid),
+                                    crate::common::mask_socket_addr(addr)
                                 );
                                 return;
                             }
-                            log::info!("New relay request {} from {}", rf.uuid, addr);
+                            log::info!(
+                                "New relay request {} from {}",
+                                crate::common::pseudonymize_uuid(&rf.uuid),
+                                crate::common::mask_socket_addr(addr)
+                            );
                             let generation =
                                 NEXT_PENDING_GENERATION.fetch_add(1, Ordering::Relaxed);
                             peers.insert(
@@ -942,7 +986,11 @@ async fn make_pair_(
                             return;
                         }
                     };
-                    log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                    log::info!(
+                        "Relay request {} from {} got paired",
+                        crate::common::pseudonymize_uuid(&rf.uuid),
+                        crate::common::mask_socket_addr(addr)
+                    );
                     let id = format!("{}:{}", addr.ip(), addr.port());
                     USAGE.write().await.insert(id.clone(), Default::default());
                     if !stream.is_ws() && !pending.stream.is_ws() {
@@ -959,8 +1007,8 @@ async fn make_pair_(
                         if is_ip_in_set(&blocklist, ip1) || is_ip_in_set(&blocklist, ip2) {
                             log::info!(
                                 "Relay pair between {} and {} rejected by blocklist",
-                                ip1,
-                                ip2
+                                crate::common::mask_ip(ip1),
+                                crate::common::mask_ip(ip2)
                             );
                             return;
                         }
@@ -972,10 +1020,10 @@ async fn make_pair_(
                     };
 
                     log::info!(
-                        "Relayrequest {} from {} got paired with {}",
-                        rf.uuid,
-                        addr,
-                        ip1
+                        "Relay request {} from {} got paired with {}",
+                        crate::common::pseudonymize_uuid(&rf.uuid),
+                        crate::common::mask_socket_addr(addr),
+                        crate::common::mask_ip(ip1)
                     );
                     let id = format!("{}:{}", addr.ip(), addr.port());
                     USAGE.write().await.insert(id.clone(), Default::default());
@@ -1002,16 +1050,23 @@ async fn make_pair_(
                     .await;
                     ACTIVE_PAIRS.fetch_sub(1, Ordering::Relaxed);
                     if let Err(err) = relay_res {
-                        log::info!("Relay of {} closed: {}", addr, err);
+                        log::info!(
+                            "Relay of {} closed: {}",
+                            crate::common::mask_socket_addr(addr),
+                            err
+                        );
                     } else {
-                        log::info!("Relay of {} closed", addr);
+                        log::info!("Relay of {} closed", crate::common::mask_socket_addr(addr));
                     }
                     USAGE.write().await.remove(&id);
                     drop(pending);
                     drop(permit);
                     drop(socket_guard);
                 } else {
-                    log::warn!("Rejected malformed relay request from {}", addr);
+                    log::warn!(
+                        "Rejected malformed relay request from {}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                 }
             }
         }
@@ -1084,7 +1139,10 @@ async fn relay(
             res = peer.recv() => {
                 if let Some(Ok(bytes)) = res {
                     let Some(_mem_permit) = memory_budget.try_acquire(bytes.len()) else {
-                        log::warn!("Relay memory budget exceeded for data from peer {}", addr);
+                        log::warn!(
+                            "Relay memory budget exceeded for data from peer {}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         bail!("Relay memory budget exceeded");
                     };
                     last_recv_time = std::time::Instant::now();
@@ -1110,7 +1168,10 @@ async fn relay(
             res = stream.recv() => {
                 if let Some(Ok(bytes)) = res {
                     let Some(_mem_permit) = memory_budget.try_acquire(bytes.len()) else {
-                        log::warn!("Relay memory budget exceeded for data from stream {}", addr);
+                        log::warn!(
+                            "Relay memory budget exceeded for data from stream {}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         bail!("Relay memory budget exceeded");
                     };
                     last_recv_time = std::time::Instant::now();
@@ -1145,7 +1206,11 @@ async fn relay(
             {
                 let blocklist = BLOCKLIST.read().await;
                 if is_ip_in_set(&blocklist, ip1) || is_ip_in_set(&blocklist, ip2) {
-                    log::info!("Relay between {} and {} terminated by blocklist", ip1, ip2);
+                    log::info!(
+                        "Relay between {} and {} terminated by blocklist",
+                        crate::common::mask_ip(ip1),
+                        crate::common::mask_ip(ip2)
+                    );
                     break;
                 }
             }
@@ -1171,7 +1236,7 @@ async fn relay(
                 downgrade = true;
                 log::info!(
                     "Downgrade {}, exceeded {:.6} of single bandwidth over {}ms",
-                    id,
+                    crate::common::mask_socket_addr(addr),
                     downgrade_threshold,
                     elapsed
                 );
@@ -1209,7 +1274,10 @@ fn get_server_sk(key: &str) -> ResultType<String> {
         }
     };
     let encoded_public_key = BASE64.encode(public_key);
-    log::info!("Relay public key loaded: {}", encoded_public_key);
+    log::info!(
+        "Relay public key loaded: {}",
+        crate::common::pseudonymize_pk(&encoded_public_key)
+    );
     Ok(encoded_public_key)
 }
 
@@ -1447,8 +1515,12 @@ mod tests {
         assert!(parse_ip_values("192.0.2.1|not-an-ip").is_err());
     }
 
+    static TEST_SOCKET_MUTEX: camellia_remote_protocol::tokio::sync::Mutex<()> =
+        camellia_remote_protocol::tokio::sync::Mutex::const_new(());
+
     #[camellia_remote_protocol::tokio::test]
     async fn stale_timeout_cannot_remove_reused_uuid() {
+        let _socket_lock = TEST_SOCKET_MUTEX.lock().await;
         let initial_sockets = accepted_sockets();
         let uuid = format!("test-{}", uuid::Uuid::new_v4());
         let semaphore = Arc::new(Semaphore::new(10));
@@ -1482,6 +1554,7 @@ mod tests {
 
     #[camellia_remote_protocol::tokio::test]
     async fn relay_pairing_holds_both_connection_permits_across_lifecycle() {
+        let _socket_lock = TEST_SOCKET_MUTEX.lock().await;
         let initial_sockets = accepted_sockets();
 
         // RES-004: Exactly 2 slots available

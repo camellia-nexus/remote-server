@@ -168,7 +168,7 @@ const HANDSHAKE_WAIT_MS: u64 = 8_000;
 struct Inner {
     serial: i32,
     api_server: String,
-    trust_proxy_headers: bool,
+    trusted_proxies: crate::common::TrustedProxyConfig,
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: sign::SecretKey,
@@ -176,6 +176,7 @@ struct Inner {
     http_proxy_slots: Arc<Semaphore>,
     http_proxy_rates: Arc<Mutex<HashMap<IpAddr, ProxyRate>>>,
     runtime_console: bool,
+    console_token: Option<Arc<str>>,
     allow_unmanaged_devices: bool,
     device_verification_token: String,
     rendezvous_rate_limiter: Arc<Mutex<SubnetRateLimiter>>,
@@ -397,17 +398,22 @@ impl RendezvousServer {
         } else if peer.uuid == *uuid {
             if peer.info.ip != ip && peer.pk != *pk {
                 log::warn!(
-                    "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                    "Peer {} ip/pk mismatch: {}/{} vs {}/{}",
                     id,
-                    ip,
-                    pk,
-                    peer.info.ip,
-                    peer.pk,
+                    crate::common::mask_ip_str(ip),
+                    crate::common::pseudonymize_pk(pk),
+                    crate::common::mask_ip_str(&peer.info.ip),
+                    crate::common::pseudonymize_pk(&peer.pk),
                 );
                 return Ok(PeerRegistrationStage::UuidMismatch);
             }
         } else {
-            log::warn!("Peer {} uuid mismatch: {:?} vs {:?}", id, uuid, peer.uuid);
+            log::warn!(
+                "Peer {} uuid mismatch: {} vs {}",
+                id,
+                crate::common::pseudonymize_uuid(uuid),
+                crate::common::pseudonymize_uuid(&peer.uuid),
+            );
             return Ok(PeerRegistrationStage::UuidMismatch);
         }
 
@@ -526,11 +532,19 @@ impl RendezvousServer {
             .build()?;
         log::info!("api_server: {}", api_server);
         let trust_proxy_headers = crate::common::get_yes_no_arg("trust-proxy-headers", false)?;
-        log::info!("trust_proxy_headers: {}", trust_proxy_headers);
+        let trusted_proxy_cidrs = crate::common::get_arg_opt("trusted-proxy-cidrs")
+            .unwrap_or_else(|| crate::common::get_arg("TRUSTED_PROXY_CIDRS"));
+        let trusted_proxies =
+            crate::common::TrustedProxyConfig::parse(trust_proxy_headers, &trusted_proxy_cidrs)?;
+        log::info!("trusted_proxies: enabled={}", trusted_proxies.is_enabled());
         let runtime_console = crate::common::get_yes_no_arg("ENABLE_RUNTIME_CONSOLE", false)?;
-        if runtime_console {
-            log::warn!("Unauthenticated loopback runtime console is enabled");
-        }
+        let console_token = if runtime_console {
+            let token = crate::common::runtime_console_token()?;
+            log::info!("Authenticated loopback runtime console is enabled");
+            Some(Arc::from(token))
+        } else {
+            None
+        };
         let mask = get_arg_opt("mask")
             .filter(|value| !value.trim().is_empty())
             .map(|value| {
@@ -573,7 +587,7 @@ impl RendezvousServer {
             inner: Arc::new(Inner {
                 serial,
                 api_server,
-                trust_proxy_headers,
+                trusted_proxies,
                 sk,
                 mask,
                 local_ip,
@@ -581,6 +595,7 @@ impl RendezvousServer {
                 http_proxy_slots: Arc::new(Semaphore::new(HTTP_PROXY_MAX_CONCURRENCY)),
                 http_proxy_rates: Default::default(),
                 runtime_console,
+                console_token,
                 allow_unmanaged_devices,
                 device_verification_token,
                 rendezvous_rate_limiter,
@@ -830,7 +845,10 @@ impl RendezvousServer {
                     return true;
                 }
                 if !self.allow_unauthenticated_request(addr.ip(), 2.0).await {
-                    log::warn!("Rate limit exceeded for RegisterPeer from {addr}");
+                    log::warn!(
+                        "Rate limit exceeded for RegisterPeer from {}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     return false;
                 }
                 log::trace!("New peer registered via tcp/ws: {:?} {:?}", rp.id, addr);
@@ -838,7 +856,10 @@ impl RendezvousServer {
                 let (resp, cu) = match self.register_peer_common(rp, addr).await {
                     Ok(result) => result,
                     Err(err) => {
-                        log::warn!("Unable to register peer from {addr}: {err}");
+                        log::warn!(
+                            "Unable to register peer from {}: {err}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         return false;
                     }
                 };
@@ -872,7 +893,10 @@ impl RendezvousServer {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        log::warn!("Unable to register peer key from {addr}: {err}");
+                        log::warn!(
+                            "Unable to register peer key from {}: {err}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         return false;
                     }
                 }
@@ -880,7 +904,10 @@ impl RendezvousServer {
             }
             Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                 if let Err(err) = self.handle_tcp_punch_hole_request(addr, ph, key, ws).await {
-                    log::warn!("Unable to route punch-hole request from {addr}: {err}");
+                    log::warn!(
+                        "Unable to route punch-hole request from {}: {err}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     return false;
                 }
                 return true;
@@ -925,7 +952,10 @@ impl RendezvousServer {
                 {
                     Ok(token) => token,
                     Err(err) => {
-                        log::warn!("Unable to reserve relay response from {addr}: {err}");
+                        log::warn!(
+                            "Unable to reserve relay response from {}: {err}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         return Self::send_relay_failure(sink, "Rendezvous server is busy");
                     }
                 };
@@ -944,7 +974,10 @@ impl RendezvousServer {
                         .lock()
                         .await
                         .remove(&rendezvous_token);
-                    log::warn!("Unable to deliver relay request from {addr}: {err}");
+                    log::warn!(
+                        "Unable to deliver relay request from {}: {err}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     return Self::send_relay_failure(sink, "Peer is offline");
                 }
                 return true;
@@ -971,7 +1004,10 @@ impl RendezvousServer {
                 {
                     Ok(pending) => pending,
                     Err(err) => {
-                        log::warn!("Rejected unmatched relay response from {addr}: {err}");
+                        log::warn!(
+                            "Rejected unmatched relay response from {}: {err}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         return false;
                     }
                 };
@@ -1021,7 +1057,10 @@ impl RendezvousServer {
                 }
                 let cost = 1.0 + (or.peers.len() as f64) / 32.0;
                 if !self.allow_unauthenticated_request(addr.ip(), cost).await {
-                    log::warn!("Rate limit exceeded for OnlineRequest from {addr}");
+                    log::warn!(
+                        "Rate limit exceeded for OnlineRequest from {}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     return false;
                 }
                 let msg_out = self.build_online_response(&or.peers).await;
@@ -1029,7 +1068,10 @@ impl RendezvousServer {
             }
             Some(rendezvous_message::Union::HttpProxyRequest(req)) => {
                 let resp = if !Self::http_proxy_authorized(true, key, &req.licence_key) {
-                    log::warn!("Rejected unauthorized API proxy request from {}", addr);
+                    log::warn!(
+                        "Rejected unauthorized API proxy request from {}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     HttpProxyResponse {
                         status: 403,
                         error: "API proxy authorization failed".to_owned(),
@@ -1046,7 +1088,11 @@ impl RendezvousServer {
                         Ok(_permit) => match self.handle_http_proxy_request(req, addr.ip()).await {
                             Ok(resp) => resp,
                             Err(err) => {
-                                log::warn!("API proxy request from {} failed: {}", addr, err);
+                                log::warn!(
+                                    "API proxy request from {} failed: {}",
+                                    crate::common::mask_socket_addr(addr),
+                                    err
+                                );
                                 HttpProxyResponse {
                                     status: 502,
                                     error: "API upstream request failed".to_owned(),
@@ -1067,13 +1113,17 @@ impl RendezvousServer {
             }
             Some(rendezvous_message::Union::Hc(hc)) => {
                 if hc.token.is_empty() || hc.token.len() > 256 {
-                    log::debug!("Ignore malformed health check from {}", addr);
+                    log::debug!(
+                        "Ignore malformed health check from {}",
+                        crate::common::mask_socket_addr(addr)
+                    );
                     return true;
                 }
                 if !*health_keepalive_started {
                     Self::start_health_check_keepalive(sink);
                     *health_keepalive_started = true;
                 }
+                Self::send_to_sink(sink, Self::health_check_response());
                 return true;
             }
             Some(rendezvous_message::Union::KeyExchange(_)) => {
@@ -1446,7 +1496,7 @@ impl RendezvousServer {
         if !key.is_empty() && ph.licence_key != key {
             log::warn!(
                 "Authentication failed from {} for peer {} - invalid key",
-                addr,
+                crate::common::mask_socket_addr(addr),
                 ph.id
             );
             let mut msg_out = RendezvousMessage::new();
@@ -2016,7 +2066,10 @@ impl RendezvousServer {
                 if let Some(token) = rendezvous_token {
                     self.pending_rendezvous.lock().await.remove(&token);
                 }
-                log::warn!("Unable to deliver punch-hole request from {addr}: {err}");
+                log::warn!(
+                    "Unable to deliver punch-hole request from {}: {err}",
+                    crate::common::mask_socket_addr(addr)
+                );
                 let mut failure = RendezvousMessage::new();
                 failure.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -2232,20 +2285,41 @@ impl RendezvousServer {
 
     async fn handle_listener2(&self, stream: TcpStream, addr: SocketAddr) {
         let Ok(permit) = self.connection_slots.clone().try_acquire_owned() else {
-            log::warn!("Rendezvous connection limit reached; rejected {}", addr);
+            log::warn!(
+                "Rendezvous connection limit reached; rejected {}",
+                crate::common::mask_socket_addr(addr)
+            );
             return;
         };
         let rs = self.clone();
         let ip = try_into_v4(addr).ip();
         if self.inner.runtime_console && ip.is_loopback() {
+            let console_token = self.inner.console_token.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let mut stream = stream;
                 let mut buffer = [0; 1024];
                 if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                     if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
-                        let res = rs.check_cmd(data).await;
-                        stream.write_all(res.as_bytes()).await.ok();
+                        let expected_token = console_token.as_deref().unwrap_or_default();
+                        if let Some(cmd) = crate::common::verify_console_auth(data, expected_token)
+                        {
+                            let res = if cmd.is_empty() {
+                                "Authenticated\n".to_owned()
+                            } else {
+                                rs.check_cmd(cmd).await
+                            };
+                            stream.write_all(res.as_bytes()).await.ok();
+                        } else {
+                            log::warn!(
+                                "Unauthorized rendezvous runtime console access attempt from {}",
+                                crate::common::mask_socket_addr(addr)
+                            );
+                            stream
+                                .write_all(b"Unauthorized: invalid or missing console authentication token\n")
+                                .await
+                                .ok();
+                        }
                     }
                 }
             });
@@ -2257,14 +2331,18 @@ impl RendezvousServer {
             let _permit = permit;
             let mut stream = stream;
             if let Err(err) = rs.attempt_handshake(&mut stream).await {
-                log::debug!("Rendezvous control handshake failed for {}: {}", addr, err);
+                log::debug!(
+                    "Rendezvous control handshake failed for {}: {}",
+                    crate::common::mask_socket_addr(addr),
+                    err
+                );
                 return;
             }
             if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
                 let Some(_mem_permit) = rs.inner.memory_budget.try_acquire(bytes.len()) else {
                     log::warn!(
                         "Rendezvous in-flight memory limit reached; dropped frame from {}",
-                        addr
+                        crate::common::mask_socket_addr(addr)
                     );
                     return;
                 };
@@ -2272,7 +2350,10 @@ impl RendezvousServer {
                     match msg_in.union {
                         Some(rendezvous_message::Union::TestNatRequest(_)) => {
                             if !rs.allow_unauthenticated_request(addr.ip(), 1.0).await {
-                                log::warn!("Rate limit exceeded for TestNatRequest from {addr} on listener2");
+                                log::warn!(
+                                    "Rate limit exceeded for TestNatRequest from {} on listener2",
+                                    crate::common::mask_socket_addr(addr)
+                                );
                                 return;
                             }
                             let mut msg_out = RendezvousMessage::new();
@@ -2289,7 +2370,10 @@ impl RendezvousServer {
                         {
                             let cost = 1.0 + (or.peers.len() as f64) / 32.0;
                             if !rs.allow_unauthenticated_request(addr.ip(), cost).await {
-                                log::warn!("Rate limit exceeded for OnlineRequest from {addr} on listener2");
+                                log::warn!(
+                                    "Rate limit exceeded for OnlineRequest from {} on listener2",
+                                    crate::common::mask_socket_addr(addr)
+                                );
                                 return;
                             }
                             allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
@@ -2304,7 +2388,10 @@ impl RendezvousServer {
     async fn handle_listener(&self, stream: TcpStream, addr: SocketAddr, key: &str, ws: bool) {
         log::debug!("Tcp connection from {:?}, ws: {}", addr, ws);
         let Ok(permit) = self.connection_slots.clone().try_acquire_owned() else {
-            log::warn!("Rendezvous connection limit reached; rejected {}", addr);
+            log::warn!(
+                "Rendezvous connection limit reached; rejected {}",
+                crate::common::mask_socket_addr(addr)
+            );
             return;
         };
         let mut rs = self.clone();
@@ -2456,33 +2543,29 @@ impl RendezvousServer {
         let mut sink;
         let mut health_keepalive_started = false;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let trust_proxy_headers = self.inner.trust_proxy_headers;
-            let callback = |req: &Request, response: Response| {
-                if trust_proxy_headers {
-                    // Only consulted when the operator opts in with --trust-proxy-headers.
-                    // These headers are NOT verifiable: anyone able to reach this port
-                    // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
-                    // and corrupting logged addresses. Enable it only when the WebSocket
-                    // port is reachable exclusively through a reverse proxy that overwrites
-                    // them (upstream reference: reverse-proxy WebSocket IP forwarding).
-                    let headers = req.headers();
-                    let real_ip = headers
-                        .get("X-Real-IP")
-                        .or_else(|| headers.get("X-Forwarded-For"))
-                        .and_then(|header_value| header_value.to_str().ok())
-                        .and_then(|value| value.split(',').next())
-                        .map(|value| value.trim())
-                        .filter(|value| !value.is_empty());
-                    if let Some(ip) = real_ip {
-                        if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
-                            // Keep the accepted TCP source port to avoid key collisions for
-                            // concurrent websocket clients from the same public IP.
-                            addr = SocketAddr::new(real_ip_addr, addr.port());
-                        }
-                    }
+            use tokio_tungstenite::tungstenite::{
+                handshake::server::{ErrorResponse, Request, Response},
+                http::StatusCode,
+            };
+            let trusted_proxies = self.inner.trusted_proxies.clone();
+            let callback = |req: &Request, response: Response| match trusted_proxies
+                .resolve_client_ip(addr.ip(), req.headers())
+            {
+                Ok(client_ip) => {
+                    addr = SocketAddr::new(client_ip, addr.port());
+                    Ok(response)
                 }
-                Ok(response)
+                Err(err) => {
+                    log::warn!(
+                        "Rejecting websocket connection from {}: invalid proxy headers: {:#}",
+                        crate::common::mask_socket_addr(addr),
+                        err
+                    );
+                    let mut rejected =
+                        ErrorResponse::new(Some("Invalid proxy client address headers".to_owned()));
+                    *rejected.status_mut() = StatusCode::BAD_REQUEST;
+                    Err(rejected)
+                }
             };
             let websocket_config = tungstenite::protocol::WebSocketConfig::default()
                 .read_buffer_size(16 * 1024)
@@ -2545,12 +2628,19 @@ impl RendezvousServer {
                     tungstenite::Message::Binary(bytes) => {
                         let Some(_mem_permit) = self.inner.memory_budget.try_acquire(bytes.len())
                         else {
-                            log::warn!("Rendezvous in-flight memory limit reached; closing WebSocket from {addr}");
+                            log::warn!(
+                                "Rendezvous in-flight memory limit reached; closing WebSocket from {}",
+                                crate::common::mask_socket_addr(addr)
+                            );
                             break;
                         };
                         let mut bytes = BytesMut::from(&bytes[..]);
                         if let Err(err) = ws_encrypt_in.dec(&mut bytes) {
-                            log::debug!("WebSocket decrypt error from {}: {}", addr, err);
+                            log::debug!(
+                                "WebSocket decrypt error from {}: {}",
+                                crate::common::mask_socket_addr(addr),
+                                err
+                            );
                             break;
                         }
                         if bytes.is_empty() {
@@ -2571,7 +2661,10 @@ impl RendezvousServer {
                         }
                     }
                     tungstenite::Message::Close(_) => {
-                        log::debug!("WebSocket close from {}", addr);
+                        log::debug!(
+                            "WebSocket close from {}",
+                            crate::common::mask_socket_addr(addr)
+                        );
                         break;
                     }
                     _ => {}
@@ -2601,7 +2694,7 @@ impl RendezvousServer {
                 tokio::select! {
                     Some(msg) = rx.recv() => {
                         if let Err(e) = stream.send(&msg).await {
-                            log::debug!("TCP send error to {}: {}", addr, e);
+                            log::debug!("TCP send error to {}: {}", crate::common::mask_socket_addr(addr), e);
                             break;
                         }
                     }
@@ -2609,7 +2702,10 @@ impl RendezvousServer {
                         match res {
                             Ok(Some(Ok(bytes))) => {
                                 let Some(_mem_permit) = self.inner.memory_budget.try_acquire(bytes.len()) else {
-                                    log::warn!("Rendezvous in-flight memory limit reached; closing TCP from {addr}");
+                                    log::warn!(
+                                        "Rendezvous in-flight memory limit reached; closing TCP from {}",
+                                        crate::common::mask_socket_addr(addr)
+                                    );
                                     break;
                                 };
                                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
@@ -2627,12 +2723,19 @@ impl RendezvousServer {
                                         break;
                                     }
                                 } else {
-                                    log::warn!("Failed to parse RendezvousMessage from {}", addr);
+                                    log::warn!(
+                                        "Failed to parse RendezvousMessage from {}",
+                                        crate::common::mask_socket_addr(addr)
+                                    );
                                     break;
                                 }
                             }
                             Ok(Some(Err(e))) => {
-                                log::debug!("TCP read error from {}: {}", addr, e);
+                                log::debug!(
+                                    "TCP read error from {}: {}",
+                                    crate::common::mask_socket_addr(addr),
+                                    e
+                                );
                                 break;
                             }
                             Ok(None) => {

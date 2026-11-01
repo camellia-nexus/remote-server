@@ -2,10 +2,13 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use camellia_remote_protocol::{
     anyhow::{Context, Result},
     crypto::sign,
-    log, ResultType,
+    log,
+    sha2::{Digest as _, Sha256},
+    ResultType,
 };
 use clap::{Arg, Command};
 use ini::Ini;
+use ipnetwork::IpNetwork;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -18,6 +21,7 @@ use std::{
     },
     time::{Instant, SystemTime},
 };
+use tungstenite::http::HeaderMap;
 
 #[allow(dead_code)]
 pub struct MemoryPermit {
@@ -80,6 +84,327 @@ impl MemoryBudget {
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
     }
+}
+
+#[allow(dead_code)]
+const MAX_TRUSTED_PROXY_CIDRS_BYTES: usize = 4 * 1024;
+#[allow(dead_code)]
+const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
+#[allow(dead_code)]
+const MAX_FORWARDED_FOR_BYTES: usize = 4 * 1024;
+#[allow(dead_code)]
+const MAX_FORWARDED_FOR_HOPS: usize = 32;
+#[allow(dead_code)]
+const MAX_PROXY_IP_BYTES: usize = 64;
+
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+pub struct TrustedProxyConfig {
+    networks: Arc<[IpNetwork]>,
+}
+
+#[allow(dead_code)]
+impl TrustedProxyConfig {
+    pub fn parse(enabled: bool, value: &str) -> ResultType<Self> {
+        let value = value.trim();
+        if !enabled {
+            if !value.is_empty() {
+                camellia_remote_protocol::bail!(
+                    "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS requires CAMELLIA_REMOTE_TRUST_PROXY_HEADERS=Y"
+                );
+            }
+            return Ok(Self::default());
+        }
+        if value.is_empty() {
+            camellia_remote_protocol::bail!(
+                "CAMELLIA_REMOTE_TRUST_PROXY_HEADERS=Y requires CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS"
+            );
+        }
+        if value.len() > MAX_TRUSTED_PROXY_CIDRS_BYTES {
+            camellia_remote_protocol::bail!(
+                "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS exceeds the {MAX_TRUSTED_PROXY_CIDRS_BYTES}-byte limit"
+            );
+        }
+
+        let mut networks = Vec::new();
+        for raw_network in value.split(',') {
+            let raw_network = raw_network.trim();
+            if raw_network.is_empty() {
+                camellia_remote_protocol::bail!(
+                    "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS contains an empty entry"
+                );
+            }
+            let parsed = raw_network
+                .parse::<IpNetwork>()
+                .with_context(|| format!("Invalid trusted proxy CIDR: {raw_network}"))?;
+            let network = IpNetwork::new(parsed.network(), parsed.prefix())
+                .with_context(|| format!("Invalid trusted proxy CIDR: {raw_network}"))?;
+            if network.prefix() == 0 {
+                camellia_remote_protocol::bail!(
+                    "Trusted proxy CIDR {raw_network} covers every address and is not allowed"
+                );
+            }
+            if networks.contains(&network) {
+                camellia_remote_protocol::bail!("Duplicate trusted proxy CIDR: {raw_network}");
+            }
+            networks.push(network);
+            if networks.len() > MAX_TRUSTED_PROXY_CIDRS {
+                camellia_remote_protocol::bail!(
+                    "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS contains more than {MAX_TRUSTED_PROXY_CIDRS} entries"
+                );
+            }
+        }
+        Ok(Self {
+            networks: networks.into(),
+        })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.networks.is_empty()
+    }
+
+    pub fn network_count(&self) -> usize {
+        self.networks.len()
+    }
+
+    pub fn resolve_client_ip(&self, tcp_peer: IpAddr, headers: &HeaderMap) -> ResultType<IpAddr> {
+        let tcp_peer = canonical_ip(tcp_peer);
+        if !self.is_enabled() || !self.is_trusted(tcp_peer) {
+            return Ok(tcp_peer);
+        }
+
+        let real_ip = single_proxy_header(headers, "x-real-ip")?
+            .map(parse_proxy_ip)
+            .transpose()?;
+        let forwarded_for = single_proxy_header(headers, "x-forwarded-for")?
+            .map(|value| self.parse_forwarded_for(value))
+            .transpose()?;
+
+        match (real_ip, forwarded_for) {
+            (Some(real_ip), Some(forwarded_for)) if real_ip != forwarded_for => {
+                camellia_remote_protocol::bail!(
+                    "X-Real-IP and X-Forwarded-For identify different clients"
+                )
+            }
+            (Some(real_ip), _) => Ok(real_ip),
+            (_, Some(forwarded_for)) => Ok(forwarded_for),
+            (None, None) => Ok(tcp_peer),
+        }
+    }
+
+    fn is_trusted(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+        self.networks.iter().any(|network| network.contains(ip))
+    }
+
+    fn parse_forwarded_for(&self, value: &str) -> ResultType<IpAddr> {
+        if value.len() > MAX_FORWARDED_FOR_BYTES {
+            camellia_remote_protocol::bail!(
+                "X-Forwarded-For exceeds the {MAX_FORWARDED_FOR_BYTES}-byte limit"
+            );
+        }
+        let mut hops = Vec::new();
+        for raw_hop in value.split(',') {
+            if hops.len() >= MAX_FORWARDED_FOR_HOPS {
+                camellia_remote_protocol::bail!(
+                    "X-Forwarded-For contains more than {MAX_FORWARDED_FOR_HOPS} hops"
+                );
+            }
+            hops.push(parse_proxy_ip(raw_hop)?);
+        }
+        for hop in hops.into_iter().rev() {
+            if !self.is_trusted(hop) {
+                return Ok(hop);
+            }
+        }
+        camellia_remote_protocol::bail!(
+            "X-Forwarded-For does not contain a client outside the trusted proxy networks"
+        )
+    }
+}
+
+#[allow(dead_code)]
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ipv6)),
+        ip => ip,
+    }
+}
+
+#[allow(dead_code)]
+fn parse_proxy_ip(value: &str) -> ResultType<IpAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        camellia_remote_protocol::bail!("Proxy client address contains an empty IP entry");
+    }
+    if value.len() > MAX_PROXY_IP_BYTES {
+        camellia_remote_protocol::bail!(
+            "Proxy client address exceeds the {MAX_PROXY_IP_BYTES}-byte limit"
+        );
+    }
+    value
+        .parse::<IpAddr>()
+        .map(canonical_ip)
+        .with_context(|| format!("Invalid proxy client IP: {value}"))
+}
+
+#[allow(dead_code)]
+fn single_proxy_header<'a>(headers: &'a HeaderMap, name: &str) -> ResultType<Option<&'a str>> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        camellia_remote_protocol::bail!("Proxy request contains duplicate {name} headers");
+    }
+    value
+        .to_str()
+        .with_context(|| format!("Proxy request contains non-text {name}"))
+        .map(Some)
+}
+
+#[allow(dead_code)]
+pub fn runtime_console_token() -> ResultType<String> {
+    let direct = get_arg_opt("console-token")
+        .or_else(|| get_arg_opt("runtime-console-token"))
+        .filter(|v| !v.trim().is_empty());
+    let file = get_arg_opt("console-token-file")
+        .or_else(|| get_arg_opt("runtime-console-token-file"))
+        .filter(|v| !v.trim().is_empty());
+    if direct.is_some() && file.is_some() {
+        camellia_remote_protocol::bail!(
+            "Set only one of CAMELLIA_REMOTE_CONSOLE_TOKEN or CAMELLIA_REMOTE_CONSOLE_TOKEN_FILE"
+        );
+    }
+    let token = if let Some(path) = file {
+        let value =
+            read_bounded_secret_file(Path::new(&path), 4096, "CAMELLIA_REMOTE_CONSOLE_TOKEN_FILE")?;
+        let s = std::str::from_utf8(&value)
+            .context("CAMELLIA_REMOTE_CONSOLE_TOKEN_FILE must be UTF-8")?;
+        s.trim().to_owned()
+    } else if let Some(t) = direct {
+        t.trim().to_owned()
+    } else {
+        camellia_remote_protocol::bail!(
+            "ENABLE_RUNTIME_CONSOLE=Y requires CAMELLIA_REMOTE_CONSOLE_TOKEN or CAMELLIA_REMOTE_CONSOLE_TOKEN_FILE"
+        );
+    };
+
+    if token.len() < 16 || token.len() > 512 || token.chars().any(char::is_control) {
+        camellia_remote_protocol::bail!(
+            "Runtime console token must be 16-512 non-control characters"
+        );
+    }
+    Ok(token)
+}
+
+#[inline]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[allow(dead_code)]
+pub fn verify_console_auth<'a>(raw_input: &'a str, expected_token: &str) -> Option<&'a str> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Check for "AUTH <token> <cmd>" or "AUTH <token>\n<cmd>"
+    if let Some(rest) = trimmed
+        .strip_prefix("AUTH ")
+        .or_else(|| trimmed.strip_prefix("auth "))
+        .or_else(|| trimmed.strip_prefix("AUTH\t"))
+        .or_else(|| trimmed.strip_prefix("auth\t"))
+        .or_else(|| trimmed.strip_prefix("AUTH\n"))
+        .or_else(|| trimmed.strip_prefix("auth\n"))
+    {
+        let rest = rest.trim_start();
+        let (supplied_token, cmd) = match rest.find(|c: char| c.is_whitespace()) {
+            Some(idx) => (&rest[..idx], rest[idx..].trim()),
+            None => (rest, ""),
+        };
+        if constant_time_eq(supplied_token.as_bytes(), expected_token.as_bytes()) {
+            return Some(cmd);
+        }
+        return None;
+    }
+    // Check for "<token> <cmd>" or "<token>\n<cmd>"
+    let (supplied_token, cmd) = match trimmed.find(|c: char| c.is_whitespace()) {
+        Some(idx) => (&trimmed[..idx], trimmed[idx..].trim()),
+        None => (trimmed, ""),
+    };
+    if constant_time_eq(supplied_token.as_bytes(), expected_token.as_bytes()) {
+        return Some(cmd);
+    }
+    None
+}
+
+#[allow(dead_code)]
+pub fn pseudonymize_uuid(uuid: impl AsRef<[u8]>) -> String {
+    let bytes = uuid.as_ref();
+    if bytes.is_empty() {
+        return "<empty-uuid>".to_owned();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"uuid-salt:");
+    hasher.update(bytes);
+    let digest = hex::encode(hasher.finalize());
+    format!("uuid#{}", &digest[..8])
+}
+
+#[allow(dead_code)]
+pub fn pseudonymize_pk(pk: impl AsRef<[u8]>) -> String {
+    let bytes = pk.as_ref();
+    if bytes.is_empty() {
+        return "<empty-pk>".to_owned();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"pk-salt:");
+    hasher.update(bytes);
+    let digest = hex::encode(hasher.finalize());
+    format!("pk#{}", &digest[..8])
+}
+
+#[allow(dead_code)]
+pub fn mask_ip(ip: impl Into<IpAddr>) -> String {
+    let ip = canonical_ip(ip.into());
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            format!("{}.{}.{}.***", octets[0], octets[1], octets[2])
+        }
+        IpAddr::V6(ipv6) => {
+            let segments = ipv6.segments();
+            format!(
+                "{:x}:{:x}:{:x}:***:***",
+                segments[0], segments[1], segments[2]
+            )
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn mask_ip_str(raw: &str) -> String {
+    match raw.trim().parse::<IpAddr>() {
+        Ok(ip) => mask_ip(ip),
+        Err(_) => raw.to_string(),
+    }
+}
+
+#[allow(dead_code)]
+pub fn mask_socket_addr(addr: impl Into<SocketAddr>) -> String {
+    let addr = addr.into();
+    format!("{}:{}", mask_ip(addr.ip()), addr.port())
 }
 
 pub fn parse_bind_address(value: &str) -> Result<Option<IpAddr>> {
@@ -1327,5 +1652,188 @@ pub(crate) mod tests {
         {
             let _ = result;
         }
+    }
+
+    #[test]
+    fn trusted_proxy_configuration_fails_closed() {
+        assert!(TrustedProxyConfig::parse(true, "").is_err());
+        assert!(TrustedProxyConfig::parse(false, "127.0.0.1/32").is_err());
+        assert!(TrustedProxyConfig::parse(true, "0.0.0.0/0").is_err());
+        assert!(TrustedProxyConfig::parse(true, "::/0").is_err());
+        assert!(TrustedProxyConfig::parse(true, "not-a-network").is_err());
+        assert!(TrustedProxyConfig::parse(true, "127.0.0.1/32,").is_err());
+        assert!(TrustedProxyConfig::parse(true, "127.0.0.1/32,127.0.0.1/32").is_err());
+        assert!(TrustedProxyConfig::parse(true, "10.0.0.1/8,10.2.3.4/8").is_err());
+
+        let config =
+            TrustedProxyConfig::parse(true, "127.0.0.1/32, 10.0.0.0/8, 2001:db8:1::/48").unwrap();
+        assert!(config.is_enabled());
+        assert_eq!(config.network_count(), 3);
+    }
+
+    #[test]
+    fn trusted_proxy_ignores_spoofed_headers_from_an_untrusted_tcp_peer() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        headers.insert("x-forwarded-for", "invalid, 198.51.100.7".parse().unwrap());
+
+        assert_eq!(
+            config
+                .resolve_client_ip("192.0.2.44".parse().unwrap(), &headers)
+                .unwrap(),
+            "192.0.2.44".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_selects_the_rightmost_untrusted_forwarded_hop() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8,2001:db8:1::/48").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.99, 203.0.113.8, 10.1.2.3".parse().unwrap(),
+        );
+
+        assert_eq!(
+            config
+                .resolve_client_ip("10.9.8.7".parse().unwrap(), &headers)
+                .unwrap(),
+            "203.0.113.8".parse::<IpAddr>().unwrap()
+        );
+
+        headers.insert(
+            "x-forwarded-for",
+            "2001:db8:ffff::5, 2001:db8:1::20".parse().unwrap(),
+        );
+        assert_eq!(
+            config
+                .resolve_client_ip("2001:db8:1::10".parse().unwrap(), &headers)
+                .unwrap(),
+            "2001:db8:ffff::5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_consistent_single_address_headers() {
+        let config = TrustedProxyConfig::parse(true, "127.0.0.0/8").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "198.51.100.10".parse().unwrap());
+        headers.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
+
+        assert_eq!(
+            config
+                .resolve_client_ip("::ffff:127.0.0.1".parse().unwrap(), &headers)
+                .unwrap(),
+            "198.51.100.10".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_ambiguous_or_malformed_headers() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8").unwrap();
+        let peer = "10.0.0.1".parse().unwrap();
+
+        let mut mismatched = HeaderMap::new();
+        mismatched.insert("x-real-ip", "198.51.100.1".parse().unwrap());
+        mismatched.insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &mismatched).is_err());
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert("x-forwarded-for", "198.51.100.1,,10.0.0.2".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &malformed).is_err());
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("x-real-ip", "198.51.100.1".parse().unwrap());
+        duplicate.append("x-real-ip", "198.51.100.2".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &duplicate).is_err());
+
+        let mut all_trusted = HeaderMap::new();
+        all_trusted.insert("x-forwarded-for", "10.0.0.2, 10.0.0.3".parse().unwrap());
+        assert!(config.resolve_client_ip(peer, &all_trusted).is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_without_address_headers_uses_the_tcp_peer() {
+        let config = TrustedProxyConfig::parse(true, "10.0.0.0/8").unwrap();
+        assert_eq!(
+            config
+                .resolve_client_ip("10.0.0.7".parse().unwrap(), &HeaderMap::new())
+                .unwrap(),
+            "10.0.0.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_console_token_fails_closed_and_verifies_length() {
+        std::env::remove_var("CAMELLIA_REMOTE_CONSOLE_TOKEN");
+        std::env::remove_var("CAMELLIA_REMOTE_CONSOLE_TOKEN_FILE");
+        assert!(runtime_console_token().is_err());
+
+        // Too short (< 16 chars)
+        std::env::set_var("CAMELLIA_REMOTE_CONSOLE_TOKEN", "short");
+        assert!(runtime_console_token().is_err());
+
+        // Valid token
+        std::env::set_var(
+            "CAMELLIA_REMOTE_CONSOLE_TOKEN",
+            "super-secret-console-token-12345",
+        );
+        assert_eq!(
+            runtime_console_token().unwrap(),
+            "super-secret-console-token-12345"
+        );
+        std::env::remove_var("CAMELLIA_REMOTE_CONSOLE_TOKEN");
+    }
+
+    #[test]
+    fn runtime_console_auth_verification_works() {
+        let expected = "super-secret-console-token-12345";
+        // Unauthenticated or wrong token
+        assert_eq!(verify_console_auth("rs", expected), None);
+        assert_eq!(verify_console_auth("wrong-token rs", expected), None);
+        assert_eq!(verify_console_auth("AUTH wrong-token rs", expected), None);
+
+        // Authenticated with AUTH prefix
+        assert_eq!(
+            verify_console_auth("AUTH super-secret-console-token-12345 rs", expected),
+            Some("rs")
+        );
+        assert_eq!(
+            verify_console_auth(
+                "auth super-secret-console-token-12345\nba 1.2.3.4",
+                expected
+            ),
+            Some("ba 1.2.3.4")
+        );
+
+        // Authenticated with direct token
+        assert_eq!(
+            verify_console_auth("super-secret-console-token-12345 rs", expected),
+            Some("rs")
+        );
+    }
+
+    #[test]
+    fn pseudonymize_and_mask_protect_pii_and_keys() {
+        let raw_uuid = "123e4567-e89b-12d3-a456-426614174000";
+        let masked_uuid = pseudonymize_uuid(raw_uuid.as_bytes());
+        assert!(masked_uuid.starts_with("uuid#"));
+        assert!(!masked_uuid.contains(raw_uuid));
+        assert_eq!(masked_uuid.len(), 13); // "uuid#" (5) + 8 hex chars
+
+        let raw_pk = [42u8; 32];
+        let masked_pk = pseudonymize_pk(raw_pk);
+        assert!(masked_pk.starts_with("pk#"));
+        assert_eq!(masked_pk.len(), 11); // "pk#" (3) + 8 hex chars
+
+        let ipv4: IpAddr = "198.51.100.42".parse().unwrap();
+        assert_eq!(mask_ip(ipv4), "198.51.100.***");
+
+        let ipv6: IpAddr = "2001:db8:85a3::8a2e:370:7334".parse().unwrap();
+        assert_eq!(mask_ip(ipv6), "2001:db8:85a3:***:***");
+
+        let socket: SocketAddr = "198.51.100.42:21116".parse().unwrap();
+        assert_eq!(mask_socket_addr(socket), "198.51.100.***:21116");
     }
 }

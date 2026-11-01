@@ -53,7 +53,25 @@ fn main() -> ResultType<()> {
             Arg::new("trust-proxy-headers")
                 .long("trust-proxy-headers")
                 .value_name("Y/N")
-                .help("Trust X-Real-IP/X-Forwarded-For on websocket listeners"),
+                .help("Trust client address headers only from configured proxy CIDRs"),
+        )
+        .arg(
+            Arg::new("trusted-proxy-cidrs")
+                .long("trusted-proxy-cidrs")
+                .value_name("CIDR,...")
+                .help("Trusted reverse proxy IPv4/IPv6 CIDRs for websocket listeners"),
+        )
+        .arg(
+            Arg::new("console-token")
+                .long("console-token")
+                .value_name("TOKEN")
+                .help("Authentication token for loopback runtime console"),
+        )
+        .arg(
+            Arg::new("console-token-file")
+                .long("console-token-file")
+                .value_name("FILE")
+                .help("Path to secure file containing console authentication token"),
         )
         .get_matches();
     if let Some(config) = matches.get_one::<String>("config") {
@@ -77,6 +95,18 @@ fn main() -> ResultType<()> {
         Some(value) => common::parse_yes_no("trust-proxy-headers", value)?,
         None => common::get_yes_no_arg("TRUST_PROXY_HEADERS", false)?,
     };
+    let trusted_proxy_cidrs = matches
+        .get_one::<String>("trusted-proxy-cidrs")
+        .map(String::to_owned)
+        .unwrap_or_else(|| common::get_arg("TRUSTED_PROXY_CIDRS"));
+    let trusted_proxies =
+        common::TrustedProxyConfig::parse(trust_proxy_headers, &trusted_proxy_cidrs)?;
+    if let Some(token) = matches.get_one::<String>("console-token") {
+        common::set_arg("console-token", token);
+    }
+    if let Some(token_file) = matches.get_one::<String>("console-token-file") {
+        common::set_arg("console-token-file", token_file);
+    }
     start_with_bind(
         bind_addr,
         matches
@@ -84,7 +114,7 @@ fn main() -> ResultType<()> {
             .map(String::as_str)
             .unwrap_or(&default_port),
         &key,
-        trust_proxy_headers,
+        trusted_proxies,
     )?;
     Ok(())
 }
