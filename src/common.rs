@@ -169,7 +169,25 @@ pub fn set_arg(name: &str, value: &str) {
 
 pub fn load_arg_file(path: &Path) -> ResultType<()> {
     const MAX_CONFIG_BYTES: usize = 1024 * 1024;
-    let contents = read_bounded_regular_file(path, MAX_CONFIG_BYTES, "Configuration file")?;
+    let mut file = open_readonly_no_follow(path)
+        .with_context(|| format!("Unable to open configuration file: {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = file
+            .metadata()
+            .with_context(|| format!("Unable to inspect configuration file: {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o022 != 0 {
+            camellia_remote_protocol::bail!(
+                "Configuration file must not be group- or world-writable: {} (mode: {:04o})",
+                path.display(),
+                mode & 0o7777
+            );
+        }
+    }
+    let contents = read_bounded_open_file(&mut file, path, MAX_CONFIG_BYTES, "Configuration file")?;
     let contents = std::str::from_utf8(&contents)
         .with_context(|| format!("Configuration file is not UTF-8: {}", path.display()))?;
     let values = Ini::load_from_str(contents)
@@ -181,9 +199,12 @@ pub fn load_arg_file(path: &Path) -> ResultType<()> {
                     "Configuration keys must use the CAMELLIA_REMOTE_ prefix: {key}"
                 );
             }
-            std::env::set_var(key, value);
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+            }
         }
     }
+    log::info!("Loaded configuration from {}", path.display());
     Ok(())
 }
 
@@ -239,6 +260,7 @@ pub(crate) fn read_bounded_regular_file(
     read_bounded_open_file(&mut file, path, max_bytes, label)
 }
 
+#[allow(dead_code)]
 pub fn load_arg_file_if_present(path: &Path) -> ResultType<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => load_arg_file(path),
@@ -256,10 +278,12 @@ pub fn init_args(args: Vec<Arg>, name: &str, about: &str) -> ResultType<()> {
         .about(about.to_owned())
         .args(args)
         .get_matches();
-    let default_path = Path::new(".env");
-    load_arg_file_if_present(default_path)?;
     if let Some(config) = matches.get_one::<String>("config") {
         load_arg_file(Path::new(config))?;
+    } else if let Ok(config) = std::env::var("CAMELLIA_REMOTE_CONFIG_FILE") {
+        if !config.trim().is_empty() {
+            load_arg_file(Path::new(&config))?;
+        }
     }
     for id in matches.ids() {
         if let Some(v) = matches.get_one::<String>(id.as_str()) {
@@ -721,6 +745,12 @@ mod tests {
         assert_eq!(get_arg("CAMELLIA_REMOTE_CONFIG_FILE_TEST"), "loaded");
         std::env::remove_var("CAMELLIA_REMOTE_CONFIG_FILE_TEST");
 
+        // Precedence: explicit config file only fills missing environment variables
+        std::env::set_var("CAMELLIA_REMOTE_CONFIG_FILE_TEST", "env_priority");
+        load_arg_file(&valid).unwrap();
+        assert_eq!(get_arg("CAMELLIA_REMOTE_CONFIG_FILE_TEST"), "env_priority");
+        std::env::remove_var("CAMELLIA_REMOTE_CONFIG_FILE_TEST");
+
         let unprefixed = directory.0.join("unprefixed.env");
         fs::write(&unprefixed, "KEY=value\n").unwrap();
         assert!(load_arg_file(&unprefixed).is_err());
@@ -740,10 +770,28 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::symlink;
+            use std::os::unix::fs::{symlink, PermissionsExt};
             let linked = directory.0.join("linked.env");
             symlink(&valid, &linked).unwrap();
             assert!(load_arg_file(&linked).is_err());
+
+            let group_writable = directory.0.join("group_writable.env");
+            fs::write(
+                &group_writable,
+                "CAMELLIA_REMOTE_CONFIG_FILE_TEST=insecure\n",
+            )
+            .unwrap();
+            fs::set_permissions(&group_writable, fs::Permissions::from_mode(0o664)).unwrap();
+            assert!(load_arg_file(&group_writable).is_err());
+
+            let world_writable = directory.0.join("world_writable.env");
+            fs::write(
+                &world_writable,
+                "CAMELLIA_REMOTE_CONFIG_FILE_TEST=insecure\n",
+            )
+            .unwrap();
+            fs::set_permissions(&world_writable, fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(load_arg_file(&world_writable).is_err());
         }
     }
 

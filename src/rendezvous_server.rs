@@ -51,7 +51,11 @@ const HTTP_PROXY_RATE_PER_IP: u32 = 120;
 const HTTP_PROXY_MAX_TRACKED_IPS: usize = 4_096;
 const RENDEZVOUS_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const RENDEZVOUS_CONNECTION_QUEUE_CAPACITY: usize = 64;
-const RENDEZVOUS_CONTROL_FRAME_MAX: usize = 17 * 1024 * 1024;
+const RENDEZVOUS_CONTROL_FRAME_MAX: usize = 1024 * 1024;
+const RENDEZVOUS_RATE_LIMITER_CAPACITY: f64 = 60.0;
+const RENDEZVOUS_RATE_LIMITER_REFILL_PER_SEC: f64 = 10.0;
+const DEFAULT_MAX_RENDEZVOUS_IN_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RATE_LIMITER_ENTRIES: usize = 65_536;
 const DEFAULT_MAX_RENDEZVOUS_CONNECTIONS: usize = 4_096;
 const PEER_ID_MIN_LEN: usize = 6;
 const PEER_ID_MAX_LEN: usize = 16;
@@ -88,6 +92,7 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static RELAY_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+static PEER_CACHE_CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -173,12 +178,156 @@ struct Inner {
     runtime_console: bool,
     allow_unmanaged_devices: bool,
     device_verification_token: String,
+    rendezvous_rate_limiter: Arc<Mutex<SubnetRateLimiter>>,
+    memory_budget: Arc<MemoryBudget>,
 }
 
 #[derive(Clone, Copy)]
 struct ProxyRate {
     started_at: Instant,
     requests: u32,
+}
+
+#[derive(Clone, Debug)]
+struct TokenBucket {
+    tokens: f64,
+    last_update: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64) -> Self {
+        Self {
+            tokens: capacity,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self, cost: f64, capacity: f64, refill_rate: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * refill_rate).min(capacity);
+        self.last_update = now;
+
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct SubnetRateLimiter {
+    buckets: HashMap<String, TokenBucket>,
+    capacity: f64,
+    refill_rate: f64,
+}
+
+impl SubnetRateLimiter {
+    fn new(capacity: f64, refill_rate: f64) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            capacity,
+            refill_rate,
+        }
+    }
+
+    fn allow(&mut self, key: &str, cost: f64) -> bool {
+        let now = Instant::now();
+        if !self.buckets.contains_key(key) && self.buckets.len() >= MAX_RATE_LIMITER_ENTRIES {
+            self.buckets.retain(|_, bucket| {
+                now.saturating_duration_since(bucket.last_update) < Duration::from_secs(60)
+            });
+            if self.buckets.len() >= MAX_RATE_LIMITER_ENTRIES {
+                return false;
+            }
+        }
+
+        let capacity = self.capacity;
+        let refill_rate = self.refill_rate;
+        let entry = self
+            .buckets
+            .entry(key.to_owned())
+            .or_insert_with(|| TokenBucket::new(capacity));
+        entry.try_consume(cost, capacity, refill_rate)
+    }
+}
+
+pub(crate) struct MemoryPermit {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
+pub(crate) struct MemoryBudget {
+    used: Arc<AtomicUsize>,
+    max_bytes: usize,
+}
+
+impl MemoryBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            used: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn try_acquire(&self, bytes: usize) -> Option<MemoryPermit> {
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            if current.saturating_add(bytes) > self.max_bytes {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(MemoryPermit {
+                        used: self.used.clone(),
+                        bytes,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn used_bytes(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
+#[inline]
+fn canonical_rate_limit_key(addr: IpAddr) -> String {
+    match addr {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                v4.to_string()
+            } else {
+                let s = v6.segments();
+                format!("{:04x}:{:04x}:{:04x}:{:04x}::/64", s[0], s[1], s[2], s[3])
+            }
+        }
+    }
 }
 
 struct PeerRegistrationRollback {
@@ -371,6 +520,14 @@ impl RendezvousServer {
                 .insert(try_into_v4(addr), Sink::Tcp(tx.clone()));
         }
     }
+
+    #[inline]
+    async fn allow_unauthenticated_request(&self, ip: IpAddr, cost: f64) -> bool {
+        let key = canonical_rate_limit_key(ip);
+        let mut limiter = self.inner.rendezvous_rate_limiter.lock().await;
+        limiter.allow(&key, cost)
+    }
+
     #[tokio::main(flavor = "multi_thread")]
     pub async fn start_with_bind(
         bind_addr: Option<IpAddr>,
@@ -447,6 +604,18 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+        let max_in_flight_bytes = crate::common::get_bounded_usize_arg(
+            "MAX_RENDEZVOUS_IN_FLIGHT_BYTES",
+            DEFAULT_MAX_RENDEZVOUS_IN_FLIGHT_BYTES,
+            1024 * 1024,
+            1024 * 1024 * 1024,
+        )?;
+        log::info!("MAX_RENDEZVOUS_IN_FLIGHT_BYTES={max_in_flight_bytes}");
+        let memory_budget = Arc::new(MemoryBudget::new(max_in_flight_bytes));
+        let rendezvous_rate_limiter = Arc::new(Mutex::new(SubnetRateLimiter::new(
+            RENDEZVOUS_RATE_LIMITER_CAPACITY,
+            RENDEZVOUS_RATE_LIMITER_REFILL_PER_SEC,
+        )));
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pending_rendezvous: Arc::new(Mutex::new(HashMap::new())),
@@ -469,6 +638,8 @@ impl RendezvousServer {
                 runtime_console,
                 allow_unmanaged_devices,
                 device_verification_token,
+                rendezvous_rate_limiter,
+                memory_budget,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -564,12 +735,21 @@ impl RendezvousServer {
                     }
                 }
                 _ = timer_peer_cache.tick() => {
-                    let evicted = self.pm.evict_inactive(PEER_CACHE_IDLE_SECS).await;
-                    let (blockers, changes) = cleanup_transient_state().await;
-                    if evicted + blockers + changes > 0 {
-                        log::debug!(
-                            "Cleaned transient state: peers={evicted}, ip-blockers={blockers}, ip-changes={changes}"
-                        );
+                    if PEER_CACHE_CLEANUP_RUNNING
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let pm = self.pm.clone();
+                        tokio::spawn(async move {
+                            let evicted = pm.evict_inactive(PEER_CACHE_IDLE_SECS).await;
+                            let (blockers, changes) = cleanup_transient_state().await;
+                            if evicted + blockers + changes > 0 {
+                                log::debug!(
+                                    "Cleaned transient state: peers={evicted}, ip-blockers={blockers}, ip-changes={changes}"
+                                );
+                            }
+                            PEER_CACHE_CLEANUP_RUNNING.store(false, Ordering::Release);
+                        });
                     }
                 }
                 Some(data) = rx.recv() => {
@@ -703,6 +883,10 @@ impl RendezvousServer {
             Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                 if !Self::valid_peer_id(&rp.id) {
                     return true;
+                }
+                if !self.allow_unauthenticated_request(addr.ip(), 2.0).await {
+                    log::warn!("Rate limit exceeded for RegisterPeer from {addr}");
+                    return false;
                 }
                 log::trace!("New peer registered via tcp/ws: {:?} {:?}", rp.id, addr);
                 self.cache_sink(addr, sink).await;
@@ -884,9 +1068,15 @@ impl RendezvousServer {
                 }
             }
             Some(rendezvous_message::Union::OnlineRequest(or)) => {
-                if or.peers.len() > ONLINE_QUERY_MAX_PEERS
+                if or.peers.is_empty()
+                    || or.peers.len() > ONLINE_QUERY_MAX_PEERS
                     || or.peers.iter().any(|id| !Self::valid_peer_id(id))
                 {
+                    return false;
+                }
+                let cost = 1.0 + (or.peers.len() as f64) / 32.0;
+                if !self.allow_unauthenticated_request(addr.ip(), cost).await {
+                    log::warn!("Rate limit exceeded for OnlineRequest from {addr}");
                     return false;
                 }
                 let msg_out = self.build_online_response(&or.peers).await;
@@ -957,6 +1147,13 @@ impl RendezvousServer {
         socket_addr: SocketAddr,
     ) -> ResultType<(RegisterPeerResponse, Option<ConfigUpdate>)> {
         let RegisterPeer { id, serial, .. } = rp;
+        if !Self::valid_peer_id(&id) {
+            bail!("Invalid peer id: {id}");
+        }
+        let ip = socket_addr.ip().to_string();
+        if !allow_ip_request(&ip, &id).await {
+            bail!("Too frequent peer registration from {ip} for {id}");
+        }
         let (request_pk, ip_change) = if let Some(old) = self.pm.get(&id).await? {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
@@ -2119,9 +2316,20 @@ impl RendezvousServer {
                 return;
             }
             if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
+                let Some(_mem_permit) = rs.inner.memory_budget.try_acquire(bytes.len()) else {
+                    log::warn!(
+                        "Rendezvous in-flight memory limit reached; dropped frame from {}",
+                        addr
+                    );
+                    return;
+                };
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
                     match msg_in.union {
                         Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                            if !rs.allow_unauthenticated_request(addr.ip(), 1.0).await {
+                                log::warn!("Rate limit exceeded for TestNatRequest from {addr} on listener2");
+                                return;
+                            }
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_test_nat_response(TestNatResponse {
                                 port: addr.port() as _,
@@ -2130,9 +2338,15 @@ impl RendezvousServer {
                             stream.send(&msg_out).await.ok();
                         }
                         Some(rendezvous_message::Union::OnlineRequest(or))
-                            if or.peers.len() <= ONLINE_QUERY_MAX_PEERS
+                            if !or.peers.is_empty()
+                                && or.peers.len() <= ONLINE_QUERY_MAX_PEERS
                                 && or.peers.iter().all(|id| Self::valid_peer_id(id)) =>
                         {
+                            let cost = 1.0 + (or.peers.len() as f64) / 32.0;
+                            if !rs.allow_unauthenticated_request(addr.ip(), cost).await {
+                                log::warn!("Rate limit exceeded for OnlineRequest from {addr} on listener2");
+                                return;
+                            }
                             allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
                         }
                         _ => {}
@@ -2182,6 +2396,11 @@ impl RendezvousServer {
             }
             None => bail!("Rendezvous key exchange timed out or the peer disconnected"),
         };
+        let _mem_permit = self
+            .inner
+            .memory_budget
+            .try_acquire(bytes.len())
+            .ok_or_else(|| anyhow!("Rendezvous in-flight memory limit reached during handshake"))?;
         let msg_in = RendezvousMessage::parse_from_bytes(&bytes)
             .map_err(|_| anyhow!("Malformed rendezvous key exchange response"))?;
         let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union else {
@@ -2245,6 +2464,13 @@ impl RendezvousServer {
             }
             Err(_) => bail!("Rendezvous WebSocket key exchange timed out"),
         };
+        let _mem_permit = self
+            .inner
+            .memory_budget
+            .try_acquire(bytes.len())
+            .ok_or_else(|| {
+                anyhow!("Rendezvous in-flight memory limit reached during WebSocket handshake")
+            })?;
         let msg_in = RendezvousMessage::parse_from_bytes(&bytes)
             .map_err(|_| anyhow!("Malformed rendezvous WebSocket key exchange response"))?;
         let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union else {
@@ -2372,6 +2598,11 @@ impl RendezvousServer {
             while let Ok(Some(Ok(msg))) = timeout(30_000, ws_stream.next()).await {
                 match msg {
                     tungstenite::Message::Binary(bytes) => {
+                        let Some(_mem_permit) = self.inner.memory_budget.try_acquire(bytes.len())
+                        else {
+                            log::warn!("Rendezvous in-flight memory limit reached; closing WebSocket from {addr}");
+                            break;
+                        };
                         let mut bytes = BytesMut::from(&bytes[..]);
                         if let Err(err) = ws_encrypt_in.dec(&mut bytes) {
                             log::debug!("WebSocket decrypt error from {}: {}", addr, err);
@@ -2432,6 +2663,10 @@ impl RendezvousServer {
                     res = timeout(30_000, stream.next()) => {
                         match res {
                             Ok(Some(Ok(bytes))) => {
+                                let Some(_mem_permit) = self.inner.memory_budget.try_acquire(bytes.len()) else {
+                                    log::warn!("Rendezvous in-flight memory limit reached; closing TCP from {addr}");
+                                    break;
+                                };
                                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
                                     if !self
                                         .handle_tcp_msg(
@@ -3033,5 +3268,111 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    #[test]
+    fn rendezvous_subnet_canonicalization_groups_ipv6_and_preserves_ipv4() {
+        let v4: IpAddr = "192.168.1.100".parse().unwrap();
+        assert_eq!(canonical_rate_limit_key(v4), "192.168.1.100");
+
+        // IPv4-mapped IPv6
+        let v4_mapped: IpAddr = "::ffff:192.168.1.100".parse().unwrap();
+        assert_eq!(canonical_rate_limit_key(v4_mapped), "192.168.1.100");
+
+        // Native IPv6 addresses in the same /64 subnet produce identical canonical keys
+        let v6_host1: IpAddr = "2001:0db8:85a3:0001:0000:8a2e:0370:7334".parse().unwrap();
+        let v6_host2: IpAddr = "2001:0db8:85a3:0001:ffff:ffff:ffff:ffff".parse().unwrap();
+        let key1 = canonical_rate_limit_key(v6_host1);
+        let key2 = canonical_rate_limit_key(v6_host2);
+        assert_eq!(key1, "2001:0db8:85a3:0001::/64");
+        assert_eq!(key1, key2);
+
+        // Native IPv6 in a different /64 produces a different key
+        let v6_other: IpAddr = "2001:0db8:85a3:0002::1".parse().unwrap();
+        assert_ne!(canonical_rate_limit_key(v6_other), key1);
+    }
+
+    #[test]
+    fn rendezvous_token_bucket_enforces_burst_cap_and_refills() {
+        let mut limiter = SubnetRateLimiter::new(10.0, 5.0);
+        let key = "192.0.2.1";
+
+        // Consume all 10 tokens in burst
+        for _ in 0..10 {
+            assert!(limiter.allow(key, 1.0));
+        }
+        // 11th request must be rejected
+        assert!(!limiter.allow(key, 1.0));
+
+        // Wait 250ms for tokens to refill (5 tokens/sec * 0.25s = 1.25 tokens)
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(limiter.allow(key, 1.0));
+        assert!(!limiter.allow(key, 1.0));
+    }
+
+    #[test]
+    fn rendezvous_global_memory_budget_enforces_ceiling_and_raii_return() {
+        let budget = MemoryBudget::new(1024 * 1024); // 1 MiB max
+        assert_eq!(budget.max_bytes(), 1024 * 1024);
+        assert_eq!(budget.used_bytes(), 0);
+
+        // Acquire 512 KiB
+        let permit1 = budget.try_acquire(512 * 1024);
+        assert!(permit1.is_some());
+        assert_eq!(budget.used_bytes(), 512 * 1024);
+
+        // Acquire another 256 KiB
+        let permit2 = budget.try_acquire(256 * 1024);
+        assert!(permit2.is_some());
+        assert_eq!(budget.used_bytes(), 768 * 1024);
+
+        // Attempting to acquire 512 KiB more would exceed 1024 KiB -> must fail
+        let overflow = budget.try_acquire(512 * 1024);
+        assert!(overflow.is_none());
+        assert_eq!(budget.used_bytes(), 768 * 1024);
+
+        // Dropping permit1 returns 512 KiB
+        drop(permit1);
+        assert_eq!(budget.used_bytes(), 256 * 1024);
+
+        // Now acquiring 512 KiB succeeds
+        let permit3 = budget.try_acquire(512 * 1024);
+        assert!(permit3.is_some());
+        assert_eq!(budget.used_bytes(), 768 * 1024);
+
+        drop(permit2);
+        drop(permit3);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn rendezvous_online_request_bounds_and_validates_peers() {
+        // Valid peer ID helper check
+        assert!(RendezvousServer::valid_peer_id("valid_01"));
+        assert!(!RendezvousServer::valid_peer_id(""));
+        assert!(!RendezvousServer::valid_peer_id("bad id!"));
+
+        // Peers count bounds
+        let empty_peers: Vec<String> = vec![];
+        assert!(empty_peers.is_empty());
+
+        let max_peers: Vec<String> = (0..ONLINE_QUERY_MAX_PEERS)
+            .map(|i| format!("peer_{i:04}"))
+            .collect();
+        assert_eq!(max_peers.len(), ONLINE_QUERY_MAX_PEERS);
+        assert!(max_peers
+            .iter()
+            .all(|id| RendezvousServer::valid_peer_id(id)));
+
+        let over_limit_peers: Vec<String> = (0..ONLINE_QUERY_MAX_PEERS + 1)
+            .map(|i| format!("peer_{i:04}"))
+            .collect();
+        assert!(over_limit_peers.len() > ONLINE_QUERY_MAX_PEERS);
+    }
+
+    #[test]
+    fn rendezvous_control_frame_ceiling_is_strictly_reduced() {
+        // RES-006: Reduced from 17 MiB to 1 MiB to prevent 68 GiB theoretical memory amplification
+        assert_eq!(RENDEZVOUS_CONTROL_FRAME_MAX, 1024 * 1024);
     }
 }

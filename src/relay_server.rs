@@ -19,7 +19,7 @@ use camellia_remote_protocol::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{Mutex, RwLock, Semaphore},
+        sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
         time::{interval, Duration},
     },
     ResultType,
@@ -48,6 +48,28 @@ struct PendingRelay {
     stream: Box<dyn StreamTrait>,
     source_ip: IpAddr,
     generation: u64,
+    _permit: OwnedSemaphorePermit,
+}
+
+static ACCEPTED_SOCKETS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_PAIRS: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+#[allow(dead_code)]
+pub fn accepted_sockets() -> usize {
+    ACCEPTED_SOCKETS.load(Ordering::Relaxed)
+}
+
+#[inline]
+#[allow(dead_code)]
+pub fn active_pairs() -> usize {
+    ACTIVE_PAIRS.load(Ordering::Relaxed)
+}
+
+#[inline]
+#[allow(dead_code)]
+pub async fn pending_endpoints() -> usize {
+    PEERS.lock().await.len()
 }
 
 #[derive(Clone)]
@@ -583,6 +605,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
         log::warn!("Relay connection limit reached; rejected {}", addr);
         return;
     };
+    ACCEPTED_SOCKETS.fetch_add(1, Ordering::Relaxed);
     let ip = camellia_remote_protocol::try_into_v4(addr).ip();
     if context.runtime_console && !ws && ip.is_loopback() {
         let limiter = context.limiter.clone();
@@ -596,20 +619,32 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
                     stream.write_all(res.as_bytes()).await.ok();
                 }
             }
+            ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
         });
         return;
     }
     let ip = ip.to_string();
     if BLOCKLIST.read().await.get(&ip).is_some() {
         log::info!("{} blocked", ip);
+        ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
         return;
     }
     let key = context.key.clone();
     let limiter = context.limiter.clone();
     let trust_proxy_headers = context.trust_proxy_headers;
     tokio::spawn(async move {
-        let _permit = permit;
-        allow_err!(make_pair(stream, addr, key.as_ref(), limiter, ws, trust_proxy_headers).await);
+        let res = make_pair(
+            stream,
+            addr,
+            key.as_ref(),
+            limiter,
+            ws,
+            trust_proxy_headers,
+            permit,
+        )
+        .await;
+        ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
+        allow_err!(res);
     });
 }
 
@@ -623,6 +658,7 @@ async fn make_pair(
     limiter: Limiter,
     ws: bool,
     trust_proxy_headers: bool,
+    permit: OwnedSemaphorePermit,
 ) -> ResultType<()> {
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -671,16 +707,22 @@ async fn make_pair(
             Ok(result) => result?,
             Err(_) => bail!("Relay WebSocket upgrade timed out"),
         };
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, key, limiter, permit).await;
     } else {
         let mut stream = FramedStream::from(stream, addr);
         *stream.codec_mut() = BytesCodec::with_max_packet_length(RELAY_CONTROL_FRAME_MAX);
-        make_pair_(stream, addr, key, limiter).await;
+        make_pair_(stream, addr, key, limiter, permit).await;
     }
     Ok(())
 }
 
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    key: &str,
+    limiter: Limiter,
+    permit: OwnedSemaphorePermit,
+) {
     let mut stream = stream;
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
@@ -718,6 +760,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                                     stream: Box::new(stream),
                                     source_ip: addr.ip(),
                                     generation,
+                                    _permit: permit,
                                 },
                             );
                             drop(peers);
@@ -734,14 +777,18 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         stream.set_raw();
                         log::info!("Both are raw");
                     }
-                    if let Err(err) =
-                        relay(addr, &mut stream, &mut pending.stream, limiter, id.clone()).await
-                    {
+                    ACTIVE_PAIRS.fetch_add(1, Ordering::Relaxed);
+                    let relay_res =
+                        relay(addr, &mut stream, &mut pending.stream, limiter, id.clone()).await;
+                    ACTIVE_PAIRS.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(err) = relay_res {
                         log::info!("Relay of {} closed: {}", addr, err);
                     } else {
                         log::info!("Relay of {} closed", addr);
                     }
                     USAGE.write().await.remove(&id);
+                    drop(pending);
+                    drop(permit);
                 } else {
                     log::warn!("Rejected malformed relay request from {}", addr);
                 }
@@ -1082,18 +1129,66 @@ mod tests {
     #[camellia_remote_protocol::tokio::test]
     async fn stale_timeout_cannot_remove_reused_uuid() {
         let uuid = format!("test-{}", uuid::Uuid::new_v4());
+        let semaphore = Arc::new(Semaphore::new(10));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(semaphore.available_permits(), 9);
+
         PEERS.lock().await.insert(
             uuid.clone(),
             PendingRelay {
                 stream: Box::new(FakeStream),
                 source_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 generation: 2,
+                _permit: permit,
             },
         );
 
         assert!(!remove_pending_if_generation(&uuid, 1).await);
         assert!(PEERS.lock().await.contains_key(&uuid));
+        assert_eq!(semaphore.available_permits(), 9);
+
         assert!(remove_pending_if_generation(&uuid, 2).await);
         assert!(!PEERS.lock().await.contains_key(&uuid));
+        // RES-004: Removing pending relay returns permit to semaphore
+        assert_eq!(semaphore.available_permits(), 10);
+    }
+
+    #[camellia_remote_protocol::tokio::test]
+    async fn relay_pairing_holds_both_connection_permits_across_lifecycle() {
+        // RES-004: Exactly 2 slots available
+        let semaphore = Arc::new(Semaphore::new(2));
+        let permit1 = semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(semaphore.available_permits(), 1);
+
+        let uuid = format!("pair-{}", uuid::Uuid::new_v4());
+        PEERS.lock().await.insert(
+            uuid.clone(),
+            PendingRelay {
+                stream: Box::new(FakeStream),
+                source_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                generation: 1,
+                _permit: permit1,
+            },
+        );
+
+        // Second connection arrives and acquires second permit
+        let permit2 = semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // A third connection attempt must fail because all 2 slots are occupied
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        // Pairing takes pending relay (with permit 1)
+        let pending = PEERS.lock().await.remove(&uuid).unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // Both permits remain held while pair is active
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // When relay session closes, both permits are dropped and returned to semaphore
+        drop(pending);
+        assert_eq!(semaphore.available_permits(), 1);
+        drop(permit2);
+        assert_eq!(semaphore.available_permits(), 2);
     }
 }

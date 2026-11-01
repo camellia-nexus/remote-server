@@ -22,6 +22,13 @@ fn main() -> ResultType<()> {
         .author("Camellia Computing")
         .about("Camellia Remote relay server")
         .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("FILE")
+                .help("Sets a custom config file"),
+        )
+        .arg(
             Arg::new("bind")
                 .short('b')
                 .long("bind")
@@ -49,8 +56,13 @@ fn main() -> ResultType<()> {
                 .help("Trust X-Real-IP/X-Forwarded-For on websocket listeners"),
         )
         .get_matches();
-    let default_path = Path::new(".env");
-    common::load_arg_file_if_present(default_path)?;
+    if let Some(config) = matches.get_one::<String>("config") {
+        common::load_arg_file(Path::new(config))?;
+    } else if let Ok(config) = std::env::var("CAMELLIA_REMOTE_CONFIG_FILE") {
+        if !config.trim().is_empty() {
+            common::load_arg_file(Path::new(&config))?;
+        }
+    }
     let default_port = common::get_arg_or("CAMELLIA_REMOTE_RELAY_PORT", RELAY_PORT.to_string());
     let bind = matches
         .get_one::<String>("bind")

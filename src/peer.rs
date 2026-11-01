@@ -12,7 +12,10 @@ use std::{
     collections::HashMap,
     collections::HashSet,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -196,9 +199,19 @@ impl Default for Peer {
 
 pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 
+const NUM_PEER_SHARDS: usize = 32;
+
+fn peer_shard_index(id: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    (hasher.finish() as usize) % NUM_PEER_SHARDS
+}
+
 #[derive(Clone)]
 pub(crate) struct PeerMap {
-    map: Arc<RwLock<HashMap<String, LockPeer>>>,
+    shards: Arc<Vec<RwLock<HashMap<String, LockPeer>>>>,
+    cached_count: Arc<AtomicUsize>,
     pub(crate) db: database::Database,
     max_cached_peers: usize,
 }
@@ -227,19 +240,70 @@ impl PeerMap {
             1_000_000,
         )?;
         log::info!("MAX_CACHED_PEERS={max_cached_peers}");
+        let mut shards = Vec::with_capacity(NUM_PEER_SHARDS);
+        for _ in 0..NUM_PEER_SHARDS {
+            shards.push(RwLock::new(HashMap::new()));
+        }
         let pm = Self {
-            map: Default::default(),
+            shards: Arc::new(shards),
+            cached_count: Arc::new(AtomicUsize::new(0)),
             db: database::Database::new(&db).await?,
             max_cached_peers,
         };
         Ok(pm)
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_database_and_capacity(
+        db: database::Database,
+        max_cached_peers: usize,
+    ) -> Self {
+        let mut shards = Vec::with_capacity(NUM_PEER_SHARDS);
+        for _ in 0..NUM_PEER_SHARDS {
+            shards.push(RwLock::new(HashMap::new()));
+        }
+        Self {
+            shards: Arc::new(shards),
+            cached_count: Arc::new(AtomicUsize::new(0)),
+            db,
+            max_cached_peers,
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.cached_count.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn shard_count(&self) -> usize {
+        NUM_PEER_SHARDS
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.max_cached_peers
+    }
+
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> ResultType<Option<LockPeer>> {
-        let p = self.map.read().await.get(id).cloned();
+        let shard_idx = peer_shard_index(id);
+        let p = self.shards[shard_idx].read().await.get(id).cloned();
         if let Some(peer) = p {
-            peer.write().await.last_access_time = Instant::now();
+            if let Ok(mut lock) = peer.try_write() {
+                lock.last_access_time = Instant::now();
+            } else {
+                peer.write().await.last_access_time = Instant::now();
+            }
             return Ok(Some(peer));
         }
 
@@ -277,86 +341,132 @@ impl PeerMap {
 
     #[inline]
     pub(crate) async fn get_in_memory(&self, id: &str) -> Option<LockPeer> {
-        let peer = self.map.read().await.get(id).cloned();
+        let shard_idx = peer_shard_index(id);
+        let peer = self.shards[shard_idx].read().await.get(id).cloned();
         if let Some(peer) = &peer {
-            peer.write().await.last_access_time = Instant::now();
+            if let Ok(mut lock) = peer.try_write() {
+                lock.last_access_time = Instant::now();
+            } else {
+                peer.write().await.last_access_time = Instant::now();
+            }
         }
         peer
     }
 
     async fn cache_peer(&self, id: String, peer: LockPeer) -> Option<LockPeer> {
+        let shard_idx = peer_shard_index(&id);
+        let shard = &self.shards[shard_idx];
+
         {
-            let map = self.map.read().await;
+            let map = shard.read().await;
             if let Some(existing) = map.get(&id) {
                 return Some(existing.clone());
             }
-            if map.len() < self.max_cached_peers {
-                drop(map);
-                let mut map = self.map.write().await;
-                if let Some(existing) = map.get(&id) {
-                    return Some(existing.clone());
-                }
-                if map.len() < self.max_cached_peers {
-                    map.insert(id, peer.clone());
-                    return Some(peer);
-                }
+        }
+
+        if self.cached_count.load(Ordering::Relaxed) < self.max_cached_peers {
+            let mut map = shard.write().await;
+            if let Some(existing) = map.get(&id) {
+                return Some(existing.clone());
+            }
+            if self.cached_count.load(Ordering::Relaxed) < self.max_cached_peers {
+                map.insert(id, peer.clone());
+                self.cached_count.fetch_add(1, Ordering::Relaxed);
+                return Some(peer);
             }
         }
 
-        self.evict_inactive(PEER_CACHE_ACTIVE_GRACE_SECS).await;
-        let mut map = self.map.write().await;
+        // Bounded incremental eviction on the target shard first
+        let evicted = self
+            .evict_shard_incremental(shard_idx, PEER_CACHE_ACTIVE_GRACE_SECS, 32)
+            .await;
+        if evicted == 0 {
+            // Try one adjacent shard if target shard had no evictable peers
+            let neighbor_idx = (shard_idx + 1) % NUM_PEER_SHARDS;
+            self.evict_shard_incremental(neighbor_idx, PEER_CACHE_ACTIVE_GRACE_SECS, 32)
+                .await;
+        }
+
+        let mut map = shard.write().await;
         if let Some(existing) = map.get(&id) {
             return Some(existing.clone());
         }
-        if map.len() >= self.max_cached_peers {
+        if self.cached_count.load(Ordering::Relaxed) >= self.max_cached_peers {
             log::warn!("Peer cache capacity reached; rejected {}", id);
             return None;
         }
         map.insert(id, peer.clone());
+        self.cached_count.fetch_add(1, Ordering::Relaxed);
         Some(peer)
     }
 
-    pub(crate) async fn evict_inactive(&self, idle_secs: u64) -> usize {
-        let snapshot = self
-            .map
-            .read()
-            .await
-            .iter()
-            .map(|(id, peer)| (id.clone(), peer.clone()))
-            .collect::<Vec<_>>();
+    async fn evict_shard_incremental(
+        &self,
+        shard_idx: usize,
+        idle_secs: u64,
+        max_to_evict: usize,
+    ) -> usize {
+        let shard = &self.shards[shard_idx];
         let mut candidates = Vec::new();
-        for (id, peer) in &snapshot {
-            let peer = peer.read().await;
-            if peer.last_access_time.elapsed().as_secs() >= idle_secs
-                && peer.last_reg_time.elapsed().as_secs() >= PEER_CACHE_ACTIVE_GRACE_SECS
-            {
-                candidates.push((id.clone(), peer.last_access_time));
+
+        {
+            let map = shard.read().await;
+            for (id, peer) in map.iter() {
+                if let Ok(peer) = peer.try_read() {
+                    if !peer.persistence_in_progress
+                        && peer.last_access_time.elapsed().as_secs() >= idle_secs
+                        && peer.last_reg_time.elapsed().as_secs() >= PEER_CACHE_ACTIVE_GRACE_SECS
+                    {
+                        candidates.push((id.clone(), peer.last_access_time));
+                        if candidates.len() >= max_to_evict {
+                            break;
+                        }
+                    }
+                }
             }
         }
+
         if candidates.is_empty() {
             return 0;
         }
 
-        let mut map = self.map.write().await;
-        let before = map.len();
+        let mut map = shard.write().await;
+        let mut evicted = 0;
         for (id, last_access_time) in candidates {
             let should_remove = map.get(&id).is_some_and(|cached| {
                 Arc::strong_count(cached) <= 2
-                    && cached
-                        .try_read()
-                        .is_ok_and(|peer| peer.last_access_time == last_access_time)
+                    && cached.try_read().is_ok_and(|p| {
+                        !p.persistence_in_progress && p.last_access_time == last_access_time
+                    })
             });
-            if should_remove {
-                map.remove(&id);
+            if should_remove && map.remove(&id).is_some() {
+                evicted += 1;
             }
         }
-        before - map.len()
+        self.cached_count.fetch_sub(evicted, Ordering::Relaxed);
+        evicted
+    }
+
+    pub(crate) async fn evict_inactive(&self, idle_secs: u64) -> usize {
+        let mut total_evicted = 0;
+        const BATCH_PER_SHARD: usize = 128;
+
+        for shard_idx in 0..NUM_PEER_SHARDS {
+            let evicted = self
+                .evict_shard_incremental(shard_idx, idle_secs, BATCH_PER_SHARD)
+                .await;
+            total_evicted += evicted;
+            // Cooperative yield between shards to prevent event loop starvation
+            camellia_remote_protocol::tokio::task::yield_now().await;
+        }
+        total_evicted
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camellia_remote_protocol::tokio;
 
     #[test]
     fn ip_request_limit_counts_the_first_request_and_enforces_exact_cap() {
@@ -479,5 +589,116 @@ mod tests {
         ));
         assert!(changes.contains_key("device02"));
         assert!(!changes.contains_key("device01"));
+    }
+
+    struct TestDb {
+        dir: std::path::PathBuf,
+    }
+
+    impl TestDb {
+        async fn create() -> (Self, database::Database) {
+            let unique = format!(
+                "peer_cache_test_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            );
+            let dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db_path = dir.join("test.sqlite3").to_string_lossy().into_owned();
+            let db = database::Database::new(&db_path).await.unwrap();
+            (Self { dir }, db)
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn sharded_peer_cache_distributes_and_retrieves_peers() {
+        let (_test_db, db) = TestDb::create().await;
+        let pm = PeerMap::with_database_and_capacity(db, 100);
+        assert_eq!(pm.len(), 0);
+        assert!(pm.is_empty());
+        assert_eq!(pm.shard_count(), NUM_PEER_SHARDS);
+        assert_eq!(pm.capacity(), 100);
+
+        for i in 0..50 {
+            let id = format!("device_{i:03}");
+            let peer = Arc::new(RwLock::new(Peer::default()));
+            let cached = pm.cache_peer(id.clone(), peer).await;
+            assert!(cached.is_some());
+        }
+        assert_eq!(pm.len(), 50);
+
+        for i in 0..50 {
+            let id = format!("device_{i:03}");
+            let retrieved = pm.get_in_memory(&id).await;
+            assert!(retrieved.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn sharded_peer_cache_incremental_eviction_protects_pinned_peers() {
+        let (_test_db, db) = TestDb::create().await;
+        let pm = PeerMap::with_database_and_capacity(db, 10);
+
+        // Insert peer that is idle and can be evicted
+        let idle_peer = Arc::new(RwLock::new(Peer {
+            last_access_time: Instant::now() - Duration::from_secs(300),
+            last_reg_time: Instant::now() - Duration::from_secs(120),
+            ..Default::default()
+        }));
+        pm.cache_peer("idle_peer".to_owned(), idle_peer).await;
+
+        // Insert peer that is pinned due to persistence_in_progress
+        let pinned_peer = Arc::new(RwLock::new(Peer {
+            last_access_time: Instant::now() - Duration::from_secs(300),
+            last_reg_time: Instant::now() - Duration::from_secs(120),
+            persistence_in_progress: true,
+            ..Default::default()
+        }));
+        pm.cache_peer("pinned_peer".to_owned(), pinned_peer).await;
+
+        assert_eq!(pm.len(), 2);
+
+        // Run evict_inactive with idle_secs = 60
+        let evicted = pm.evict_inactive(60).await;
+        assert_eq!(evicted, 1);
+        assert_eq!(pm.len(), 1);
+
+        // idle_peer should be gone, pinned_peer should still exist
+        assert!(pm.get_in_memory("idle_peer").await.is_none());
+        assert!(pm.get_in_memory("pinned_peer").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn sharded_peer_cache_enforces_capacity_limit() {
+        let (_test_db, db) = TestDb::create().await;
+        let pm = PeerMap::with_database_and_capacity(db, 5);
+
+        // Insert 5 active peers (within grace period so they cannot be evicted)
+        for i in 0..5 {
+            let id = format!("active_{i}");
+            let peer = Arc::new(RwLock::new(Peer {
+                last_access_time: Instant::now(),
+                last_reg_time: Instant::now(),
+                ..Default::default()
+            }));
+            assert!(pm.cache_peer(id, peer).await.is_some());
+        }
+        assert_eq!(pm.len(), 5);
+
+        // Attempting to insert a 6th peer when all are active must be rejected
+        let extra_peer = Arc::new(RwLock::new(Peer {
+            last_access_time: Instant::now(),
+            last_reg_time: Instant::now(),
+            ..Default::default()
+        }));
+        let result = pm.cache_peer("overflow_peer".to_owned(), extra_peer).await;
+        assert!(result.is_none());
+        assert_eq!(pm.len(), 5);
     }
 }
