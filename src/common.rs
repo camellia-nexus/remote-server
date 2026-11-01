@@ -783,8 +783,8 @@ pub async fn listen_signal() -> Result<()> {
 
 #[cfg(not(unix))]
 pub async fn listen_signal() -> Result<()> {
-    let () = std::future::pending().await;
-    unreachable!();
+    use camellia_remote_protocol::tokio;
+    tokio::signal::ctrl_c().await.map_err(|e| e.into())
 }
 #[cfg(test)]
 pub(crate) mod tests {

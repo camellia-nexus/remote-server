@@ -42,6 +42,64 @@ lazy_static::lazy_static! {
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+    static ref SHARED_IP_LIMITERS: std::sync::Mutex<HashMap<IpAddr, (Limiter, usize)>> = Default::default();
+}
+
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else {
+                IpAddr::V6(v6)
+            }
+        }
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
+pub(crate) fn is_ip_in_set(set: &HashSet<String>, ip: IpAddr) -> bool {
+    let canon = canonical_ip(ip);
+    set.contains(&canon.to_string()) || set.contains(&ip.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) struct IpLimiterGuard {
+    ip: IpAddr,
+    limiter: Limiter,
+}
+
+impl IpLimiterGuard {
+    pub(crate) fn acquire(ip: IpAddr) -> Self {
+        let canon = canonical_ip(ip);
+        let mut map = SHARED_IP_LIMITERS.lock().unwrap();
+        let entry = map.entry(canon).or_insert_with(|| {
+            let sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64;
+            (Limiter::new(sb), 0)
+        });
+        entry.1 += 1;
+        Self {
+            ip: canon,
+            limiter: entry.0.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn limiter(&self) -> &Limiter {
+        &self.limiter
+    }
+}
+
+impl Drop for IpLimiterGuard {
+    fn drop(&mut self) {
+        let mut map = SHARED_IP_LIMITERS.lock().unwrap();
+        if let Some(entry) = map.get_mut(&self.ip) {
+            entry.1 = entry.1.saturating_sub(1);
+            if entry.1 == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -141,9 +199,9 @@ fn parse_ip_values(value: &str) -> ResultType<Vec<String>> {
         let ip = raw_ip
             .trim()
             .parse::<IpAddr>()
-            .with_context(|| format!("Invalid IP address: {raw_ip}"))?
-            .to_string();
-        ips.push(ip);
+            .with_context(|| format!("Invalid IP address: {raw_ip}"))?;
+        let canon = canonical_ip(ip).to_string();
+        ips.push(canon);
         if ips.len() > 64 {
             bail!("Too many IP addresses in one command");
         }
@@ -181,7 +239,7 @@ fn load_ip_list(path: &str) -> ResultType<HashSet<String>> {
                 line_index + 1
             )
         })?;
-        ips.insert(ip.to_string());
+        ips.insert(canonical_ip(ip).to_string());
         if ips.len() > MAX_IP_LIST_ENTRIES {
             bail!("{} contains too many entries", path.display());
         }
@@ -292,10 +350,92 @@ fn parse_downgrade_start(value: &str) -> ResultType<usize> {
     })
 }
 
-fn parse_bandwidth(name: &str, value: &str) -> ResultType<usize> {
-    let megabits = value.parse::<f64>()?;
-    let bits = megabits * 1024.0 * 1024.0;
-    if !megabits.is_finite() || megabits <= 0.0 || !bits.is_finite() || bits > usize::MAX as f64 {
+fn parse_bandwidth(name: &str, raw_value: &str) -> ResultType<usize> {
+    let raw = raw_value.trim();
+    if raw.is_empty() {
+        bail!("{name} must not be empty");
+    }
+
+    let unit_index = raw
+        .find(|c: char| c.is_alphabetic() || c == '/')
+        .unwrap_or(raw.len());
+    let (num_part, unit_part) = raw.split_at(unit_index);
+    let num_str = num_part.trim();
+    let unit_str = unit_part.trim();
+
+    let num = num_str.parse::<f64>()?;
+    if !num.is_finite() || num <= 0.0 {
+        bail!("{name} must be a positive bandwidth supported by this architecture");
+    }
+
+    let multiplier: f64 = match unit_str {
+        "" => 1024.0 * 1024.0, // default Mb/s
+        // Explicit byte units (case-sensitive or byte words)
+        "B" | "B/s" | "Bps" | "bytes" | "byte/s" => 8.0,
+        "KB" | "KB/s" | "KBps" | "kB" | "kB/s" => 8.0 * 1024.0,
+        "MB" | "MB/s" | "MBps" => 8.0 * 1024.0 * 1024.0,
+        "GB" | "GB/s" | "GBps" => 8.0 * 1024.0 * 1024.0 * 1024.0,
+        u if u.eq_ignore_ascii_case("kib")
+            || u.eq_ignore_ascii_case("kib/s")
+            || u.eq_ignore_ascii_case("kbyte")
+            || u.eq_ignore_ascii_case("kbytes") =>
+        {
+            8.0 * 1024.0
+        }
+        u if u.eq_ignore_ascii_case("mib")
+            || u.eq_ignore_ascii_case("mib/s")
+            || u.eq_ignore_ascii_case("mbyte")
+            || u.eq_ignore_ascii_case("mbytes") =>
+        {
+            8.0 * 1024.0 * 1024.0
+        }
+        u if u.eq_ignore_ascii_case("gib")
+            || u.eq_ignore_ascii_case("gib/s")
+            || u.eq_ignore_ascii_case("gbyte")
+            || u.eq_ignore_ascii_case("gbytes") =>
+        {
+            8.0 * 1024.0 * 1024.0 * 1024.0
+        }
+        // Bit units (case-insensitive)
+        u if u.eq_ignore_ascii_case("b/s")
+            || u.eq_ignore_ascii_case("bps")
+            || u.eq_ignore_ascii_case("bit/s")
+            || u.eq_ignore_ascii_case("bits/s") =>
+        {
+            1.0
+        }
+        u if u.eq_ignore_ascii_case("k")
+            || u.eq_ignore_ascii_case("kb")
+            || u.eq_ignore_ascii_case("kbps")
+            || u.eq_ignore_ascii_case("kbit")
+            || u.eq_ignore_ascii_case("kb/s")
+            || u.eq_ignore_ascii_case("kbit/s") =>
+        {
+            1024.0
+        }
+        u if u.eq_ignore_ascii_case("m")
+            || u.eq_ignore_ascii_case("mb")
+            || u.eq_ignore_ascii_case("mbps")
+            || u.eq_ignore_ascii_case("mbit")
+            || u.eq_ignore_ascii_case("mb/s")
+            || u.eq_ignore_ascii_case("mbit/s") =>
+        {
+            1024.0 * 1024.0
+        }
+        u if u.eq_ignore_ascii_case("g")
+            || u.eq_ignore_ascii_case("gb")
+            || u.eq_ignore_ascii_case("gbps")
+            || u.eq_ignore_ascii_case("gbit")
+            || u.eq_ignore_ascii_case("gb/s")
+            || u.eq_ignore_ascii_case("gbit/s") =>
+        {
+            1024.0 * 1024.0 * 1024.0
+        }
+        _ => bail!("Unknown bandwidth unit '{unit_str}' in {name}"),
+    };
+
+    let bits = num * multiplier;
+    if !bits.is_finite() || bits <= 0.0 || bits > usize::MAX as f64 {
         bail!("{name} must be a positive bandwidth supported by this architecture");
     }
     Ok(bits.round() as usize)
@@ -424,7 +564,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(ip) = fds.next() {
                 match ip.parse::<IpAddr>() {
                     Ok(ip) => {
-                        res = format!("{}\n", BLACKLIST.read().await.contains(&ip.to_string()));
+                        res = format!("{}\n", is_ip_in_set(&*BLACKLIST.read().await, ip));
                     }
                     Err(_) => res = format!("Invalid IP address: {ip}\n"),
                 }
@@ -471,7 +611,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(ip) = fds.next() {
                 match ip.parse::<IpAddr>() {
                     Ok(ip) => {
-                        res = format!("{}\n", BLOCKLIST.read().await.contains(&ip.to_string()));
+                        res = format!("{}\n", is_ip_in_set(&*BLOCKLIST.read().await, ip));
                     }
                     Err(_) => res = format!("Invalid IP address: {ip}\n"),
                 }
@@ -661,8 +801,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
         });
         return;
     }
-    let ip = ip.to_string();
-    if BLOCKLIST.read().await.get(&ip).is_some() {
+    if is_ip_in_set(&*BLOCKLIST.read().await, ip) {
         log::info!("{} blocked", ip);
         return;
     }
@@ -732,6 +871,10 @@ async fn make_pair(
             Ok(result) => result?,
             Err(_) => bail!("Relay WebSocket upgrade timed out"),
         };
+        if is_ip_in_set(&*BLOCKLIST.read().await, addr.ip()) {
+            log::info!("{} blocked after websocket upgrade", addr.ip());
+            return Ok(());
+        }
         make_pair_(ws_stream, addr, &context, permit, socket_guard).await;
     } else {
         let mut stream = FramedStream::from(stream, addr);
@@ -808,12 +951,52 @@ async fn make_pair_(
                         log::info!("Both are raw");
                     }
                     ACTIVE_PAIRS.fetch_add(1, Ordering::Relaxed);
-                    let relay_res = relay(
+                    let ip1 = pending.source_ip;
+                    let ip2 = addr.ip();
+
+                    {
+                        let blocklist = BLOCKLIST.read().await;
+                        if is_ip_in_set(&blocklist, ip1) || is_ip_in_set(&blocklist, ip2) {
+                            log::info!(
+                                "Relay pair between {} and {} rejected by blocklist",
+                                ip1,
+                                ip2
+                            );
+                            return;
+                        }
+                    }
+
+                    let blacked = {
+                        let blacklist = BLACKLIST.read().await;
+                        is_ip_in_set(&blacklist, ip1) || is_ip_in_set(&blacklist, ip2)
+                    };
+
+                    log::info!(
+                        "Relayrequest {} from {} got paired with {}",
+                        rf.uuid,
                         addr,
+                        ip1
+                    );
+                    let id = format!("{}:{}", addr.ip(), addr.port());
+                    USAGE.write().await.insert(id.clone(), Default::default());
+                    if !stream.is_ws() && !pending.stream.is_ws() {
+                        pending.stream.set_raw();
+                        stream.set_raw();
+                        log::info!("Both are raw");
+                    }
+                    ACTIVE_PAIRS.fetch_add(1, Ordering::Relaxed);
+                    let session_params = RelaySessionParams {
+                        ip1,
+                        ip2,
+                        addr,
+                        id: id.clone(),
+                        blacked,
+                    };
+                    let relay_res = relay(
+                        session_params,
                         &mut stream,
                         &mut pending.stream,
                         context.limiter.clone(),
-                        id.clone(),
                         context.memory_budget.clone(),
                     )
                     .await;
@@ -855,25 +1038,43 @@ async fn remove_pending_if_generation(uuid: &str, generation: u64) -> bool {
     }
 }
 
-async fn relay(
+struct RelaySessionParams {
+    ip1: IpAddr,
+    ip2: IpAddr,
     addr: SocketAddr,
+    id: String,
+    blacked: bool,
+}
+
+async fn relay(
+    params: RelaySessionParams,
     stream: &mut impl StreamTrait,
     peer: &mut Box<dyn StreamTrait>,
     total_limiter: Limiter,
-    id: String,
     memory_budget: Arc<crate::common::MemoryBudget>,
 ) -> ResultType<()> {
-    let ip = addr.ip().to_string();
+    let RelaySessionParams {
+        ip1,
+        ip2,
+        addr,
+        id,
+        mut blacked,
+    } = params;
+    let ip1_guard = IpLimiterGuard::acquire(ip1);
+    let ip2_guard = if canonical_ip(ip1) != canonical_ip(ip2) {
+        Some(IpLimiterGuard::acquire(ip2))
+    } else {
+        None
+    };
+    let pair_limiter = <Limiter>::new(SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64);
+    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::SeqCst) as f64);
     let mut tm = std::time::Instant::now();
     let mut elapsed = 0;
     let mut total = 0;
     let mut total_s = 0;
     let mut highest_s = 0;
     let mut downgrade: bool = false;
-    let mut blacked: bool = false;
     let sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64;
-    let limiter = <Limiter>::new(sb);
-    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::SeqCst) as _);
     let downgrade_threshold =
         DOWNGRADE_THRESHOLD_SCALED.load(Ordering::SeqCst) as f64 / DOWNGRADE_THRESHOLD_SCALE as f64;
     let mut timer = interval(Duration::from_secs(3));
@@ -888,12 +1089,15 @@ async fn relay(
                     };
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
+                    ip1_guard.limiter.consume(nb).await;
+                    if let Some(ref g2) = ip2_guard {
+                        g2.limiter.consume(nb).await;
+                    }
+                    pair_limiter.consume(nb).await;
+                    total_limiter.consume(nb).await;
                     if blacked || downgrade {
                         blacklist_limiter.consume(nb).await;
-                    } else {
-                        limiter.consume(nb).await;
                     }
-                    total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
@@ -911,12 +1115,15 @@ async fn relay(
                     };
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
+                    ip1_guard.limiter.consume(nb).await;
+                    if let Some(ref g2) = ip2_guard {
+                        g2.limiter.consume(nb).await;
+                    }
+                    pair_limiter.consume(nb).await;
+                    total_limiter.consume(nb).await;
                     if blacked || downgrade {
                         blacklist_limiter.consume(nb).await;
-                    } else {
-                        limiter.consume(nb).await;
                     }
-                    total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
@@ -935,11 +1142,17 @@ async fn relay(
 
         let n = tm.elapsed().as_millis() as usize;
         if n >= 1_000 {
-            if BLOCKLIST.read().await.get(&ip).is_some() {
-                log::info!("{} blocked", ip);
-                break;
+            {
+                let blocklist = BLOCKLIST.read().await;
+                if is_ip_in_set(&blocklist, ip1) || is_ip_in_set(&blocklist, ip2) {
+                    log::info!("Relay between {} and {} terminated by blocklist", ip1, ip2);
+                    break;
+                }
             }
-            blacked = BLACKLIST.read().await.get(&ip).is_some();
+            {
+                let blacklist = BLACKLIST.read().await;
+                blacked = is_ip_in_set(&blacklist, ip1) || is_ip_in_set(&blacklist, ip2);
+            }
             tm = std::time::Instant::now();
             let speed = total_s / n;
             if speed > highest_s {
@@ -1128,14 +1341,75 @@ mod tests {
             parse_bandwidth("LIMIT_SPEED", "32").unwrap(),
             32 * 1024 * 1024
         );
+        assert_eq!(
+            parse_bandwidth("LIMIT_SPEED", "32Mb").unwrap(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bandwidth("LIMIT_SPEED", "32Mbps").unwrap(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bandwidth("LIMIT_SPEED", "4MB").unwrap(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bandwidth("LIMIT_SPEED", "4MB/s").unwrap(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bandwidth("TOTAL_BANDWIDTH", "1Gb").unwrap(),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_bandwidth("TOTAL_BANDWIDTH", "1024Mb").unwrap(),
+            1024 * 1024 * 1024
+        );
 
         for value in ["0", "0.0000001", "-1", "1.01", "NaN", "infinity"] {
             assert!(parse_downgrade_threshold(value).is_err(), "{value}");
         }
-        for value in ["0", "-1", "not-a-number"] {
+        for value in ["0", "-1", "not-a-number", "32invalid", ""] {
             assert!(parse_downgrade_start(value).is_err(), "{value}");
             assert!(parse_bandwidth("LIMIT_SPEED", value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn canonical_ip_and_set_matching_works() {
+        let v4 = "192.0.2.1".parse::<IpAddr>().unwrap();
+        let v6_mapped = "::ffff:192.0.2.1".parse::<IpAddr>().unwrap();
+        let v6_regular = "2001:db8::1".parse::<IpAddr>().unwrap();
+
+        assert_eq!(canonical_ip(v4), v4);
+        assert_eq!(canonical_ip(v6_mapped), v4);
+        assert_eq!(canonical_ip(v6_regular), v6_regular);
+
+        let mut set = HashSet::new();
+        set.insert("192.0.2.1".to_owned());
+        set.insert("2001:db8::1".to_owned());
+
+        assert!(is_ip_in_set(&set, v4));
+        assert!(is_ip_in_set(&set, v6_mapped));
+        assert!(is_ip_in_set(&set, v6_regular));
+        assert!(!is_ip_in_set(&set, "192.0.2.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn ip_limiter_guard_lifecycle_and_refcounting() {
+        let ip = "198.51.100.5".parse::<IpAddr>().unwrap();
+        {
+            let _guard1 = IpLimiterGuard::acquire(ip);
+            {
+                let _guard2 = IpLimiterGuard::acquire(ip);
+                let map = SHARED_IP_LIMITERS.lock().unwrap();
+                assert_eq!(map.get(&ip).unwrap().1, 2);
+            }
+            let map = SHARED_IP_LIMITERS.lock().unwrap();
+            assert_eq!(map.get(&ip).unwrap().1, 1);
+        }
+        let map = SHARED_IP_LIMITERS.lock().unwrap();
+        assert!(!map.contains_key(&ip));
     }
 
     #[test]

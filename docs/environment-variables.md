@@ -31,8 +31,10 @@ Both long-lived binaries accept command-line flags and canonical environment var
 | Variable | Default | Contract |
 | --- | ---: | --- |
 | `CAMELLIA_REMOTE_RELAY_PORT` | `21117` | TCP relay port; WebSocket is +2 |
-| `CAMELLIA_REMOTE_LIMIT_SPEED` | `4Mb` | per-connection relay limit |
-| `CAMELLIA_REMOTE_TOTAL_BANDWIDTH` | `1Gb` | total relay limit |
-| `CAMELLIA_REMOTE_SINGLE_BANDWIDTH` | `16Mb` | single-IP relay limit |
+| `CAMELLIA_REMOTE_LIMIT_SPEED` | `32Mb` | per-connection downgrade/blacklist relay limit (32 Mbit/s, 4 MB/s) |
+| `CAMELLIA_REMOTE_TOTAL_BANDWIDTH` | `1024Mb` | total aggregate relay limit (1024 Mbit/s, 1 Gbit/s) |
+| `CAMELLIA_REMOTE_SINGLE_BANDWIDTH` | `128Mb` | single-IP aggregate relay limit (128 Mbit/s, 16 MB/s) |
+
+Bandwidth settings accept optional explicit unit suffixes (case-insensitive for bit units like `bps`, `kbps`, `mbps`, `gbps`, and byte units like `B/s`, `KB/s`, `MB/s`, `GB/s`). Unadorned numbers default to `Mb/s`.
 
 The included systemd and Compose definitions use these names. Configuration files containing unprefixed or obsolete keys fail closed.
