@@ -26,9 +26,17 @@ cargo test --locked --workspace --all-features
 
 ## Configuration
 
-Command-line arguments override environment values. A bounded INI-style
-`.env` file in the working directory is also supported. Production services
-should use a root-owned environment file and secret files instead.
+Configuration values follow strict precedence: command-line arguments take
+precedence over process environment variables, which take precedence over
+explicit configuration files, followed by defaults (`CLI > environment >
+config file > defaults`).
+
+To specify a configuration file, use `--config <FILE>` / `-c <FILE>` or set the
+`CAMELLIA_REMOTE_CONFIG_FILE` environment variable. Implicit or ambient `.env`
+files in the working directory are not automatically loaded. Configuration files
+must be regular files, must not be group- or world-writable, and on Unix systems
+must be owned by `root` (UID 0) or the running process's effective UID. Production
+services should use a root-owned environment file and secret files instead.
 
 Important settings:
 

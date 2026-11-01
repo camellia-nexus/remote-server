@@ -255,66 +255,6 @@ impl SubnetRateLimiter {
     }
 }
 
-pub(crate) struct MemoryPermit {
-    used: Arc<AtomicUsize>,
-    bytes: usize,
-}
-
-impl Drop for MemoryPermit {
-    fn drop(&mut self) {
-        self.used.fetch_sub(self.bytes, Ordering::Release);
-    }
-}
-
-pub(crate) struct MemoryBudget {
-    used: Arc<AtomicUsize>,
-    max_bytes: usize,
-}
-
-impl MemoryBudget {
-    pub(crate) fn new(max_bytes: usize) -> Self {
-        Self {
-            used: Arc::new(AtomicUsize::new(0)),
-            max_bytes,
-        }
-    }
-
-    pub(crate) fn try_acquire(&self, bytes: usize) -> Option<MemoryPermit> {
-        let mut current = self.used.load(Ordering::Relaxed);
-        loop {
-            if current.saturating_add(bytes) > self.max_bytes {
-                return None;
-            }
-            match self.used.compare_exchange_weak(
-                current,
-                current + bytes,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(MemoryPermit {
-                        used: self.used.clone(),
-                        bytes,
-                    });
-                }
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn used_bytes(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn max_bytes(&self) -> usize {
-        self.max_bytes
-    }
-}
-
 #[inline]
 fn canonical_rate_limit_key(addr: IpAddr) -> String {
     match addr {

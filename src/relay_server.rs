@@ -44,11 +44,28 @@ lazy_static::lazy_static! {
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
 }
 
+#[derive(Debug)]
+pub(crate) struct AcceptedSocketGuard;
+
+impl AcceptedSocketGuard {
+    pub(crate) fn new() -> Self {
+        ACCEPTED_SOCKETS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for AcceptedSocketGuard {
+    fn drop(&mut self) {
+        ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct PendingRelay {
     stream: Box<dyn StreamTrait>,
     source_ip: IpAddr,
     generation: u64,
     _permit: OwnedSemaphorePermit,
+    _socket_guard: AcceptedSocketGuard,
 }
 
 static ACCEPTED_SOCKETS: AtomicUsize = AtomicUsize::new(0);
@@ -79,6 +96,7 @@ struct RelayContext {
     trust_proxy_headers: bool,
     runtime_console: bool,
     connection_slots: Arc<Semaphore>,
+    memory_budget: Arc<crate::common::MemoryBudget>,
 }
 
 const DOWNGRADE_THRESHOLD_SCALE: usize = 1_000_000;
@@ -89,11 +107,27 @@ static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // i
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
 static NEXT_PENDING_GENERATION: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_MAX_RELAY_CONNECTIONS: usize = 8_192;
+const DEFAULT_MAX_RELAY_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PENDING_RELAYS: usize = 4_096;
 const MAX_PENDING_RELAYS_PER_IP: usize = 32;
 const RELAY_CONTROL_FRAME_MAX: usize = 64 * 1024;
-const RELAY_WEBSOCKET_FRAME_MAX: usize = 8 * 1024 * 1024;
+const RELAY_WEBSOCKET_FRAME_MAX: usize = 4 * 1024 * 1024;
 const WEBSOCKET_UPGRADE_TIMEOUT_MS: u64 = 10_000;
+
+pub(crate) fn validate_relay_startup_params(
+    max_connections: usize,
+    max_in_flight_bytes: usize,
+) -> ResultType<()> {
+    if max_connections < 2 {
+        bail!("MAX_RELAY_CONNECTIONS ({max_connections}) must be at least 2");
+    }
+    if max_in_flight_bytes < RELAY_WEBSOCKET_FRAME_MAX {
+        bail!(
+            "MAX_RELAY_IN_FLIGHT_BYTES ({max_in_flight_bytes}) must be at least RELAY_WEBSOCKET_FRAME_MAX ({RELAY_WEBSOCKET_FRAME_MAX})"
+        );
+    }
+    Ok(())
+}
 const RELAY_UUID_MIN_LEN: usize = 8;
 const RELAY_UUID_MAX_LEN: usize = 128;
 const BLACKLIST_FILE: &str = "blacklist.txt";
@@ -187,12 +221,29 @@ pub async fn start_with_bind(
     let max_connections = crate::common::get_bounded_usize_arg(
         "MAX_RELAY_CONNECTIONS",
         DEFAULT_MAX_RELAY_CONNECTIONS,
-        64,
+        2,
         65_536,
     )?;
+    let max_in_flight_bytes = crate::common::get_bounded_usize_arg(
+        "MAX_RELAY_IN_FLIGHT_BYTES",
+        DEFAULT_MAX_RELAY_IN_FLIGHT_BYTES,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024 * 1024,
+    )?;
+    validate_relay_startup_params(max_connections, max_in_flight_bytes)?;
     let connection_slots = Arc::new(Semaphore::new(max_connections));
+    let memory_budget = Arc::new(crate::common::MemoryBudget::new(max_in_flight_bytes));
     log::info!("MAX_RELAY_CONNECTIONS={max_connections}");
+    log::info!("MAX_RELAY_IN_FLIGHT_BYTES={max_in_flight_bytes}");
     check_params()?;
+    let context = RelayContext {
+        limiter: <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _),
+        key: Arc::from(key.as_str()),
+        trust_proxy_headers,
+        runtime_console,
+        connection_slots,
+        memory_budget,
+    };
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
@@ -207,10 +258,7 @@ pub async fn start_with_bind(
                 } else {
                     None
                 },
-                &key,
-                trust_proxy_headers,
-                runtime_console,
-                connection_slots.clone(),
+                context.clone(),
             )
             .await;
         }
@@ -544,18 +592,8 @@ async fn io_loop(
     listener: TcpListener,
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
-    key: &str,
-    trust_proxy_headers: bool,
-    runtime_console: bool,
-    connection_slots: Arc<Semaphore>,
+    context: RelayContext,
 ) {
-    let context = RelayContext {
-        limiter: <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _),
-        key: Arc::from(key),
-        trust_proxy_headers,
-        runtime_console,
-        connection_slots,
-    };
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -605,12 +643,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
         log::warn!("Relay connection limit reached; rejected {}", addr);
         return;
     };
-    ACCEPTED_SOCKETS.fetch_add(1, Ordering::Relaxed);
+    let socket_guard = AcceptedSocketGuard::new();
     let ip = camellia_remote_protocol::try_into_v4(addr).ip();
     if context.runtime_console && !ws && ip.is_loopback() {
         let limiter = context.limiter.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _socket_guard = socket_guard;
             let mut stream = stream;
             let mut buffer = [0; 1024];
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
@@ -619,31 +658,17 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
                     stream.write_all(res.as_bytes()).await.ok();
                 }
             }
-            ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
         });
         return;
     }
     let ip = ip.to_string();
     if BLOCKLIST.read().await.get(&ip).is_some() {
         log::info!("{} blocked", ip);
-        ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
         return;
     }
-    let key = context.key.clone();
-    let limiter = context.limiter.clone();
-    let trust_proxy_headers = context.trust_proxy_headers;
+    let context = context.clone();
     tokio::spawn(async move {
-        let res = make_pair(
-            stream,
-            addr,
-            key.as_ref(),
-            limiter,
-            ws,
-            trust_proxy_headers,
-            permit,
-        )
-        .await;
-        ACCEPTED_SOCKETS.fetch_sub(1, Ordering::Relaxed);
+        let res = make_pair(stream, addr, ws, context, permit, socket_guard).await;
         allow_err!(res);
     });
 }
@@ -654,22 +679,22 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
 async fn make_pair(
     stream: TcpStream,
     mut addr: SocketAddr,
-    key: &str,
-    limiter: Limiter,
     ws: bool,
-    trust_proxy_headers: bool,
+    context: RelayContext,
     permit: OwnedSemaphorePermit,
+    socket_guard: AcceptedSocketGuard,
 ) -> ResultType<()> {
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-        let callback = |req: &Request, response: Response| {
+        let trust_proxy_headers = context.trust_proxy_headers;
+        let callback = move |req: &Request, response: Response| {
             if trust_proxy_headers {
                 // Only consulted when the operator opts in with --trust-proxy-headers.
                 // These headers are NOT verifiable: anyone able to reach this port
                 // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
                 // and corrupting logged addresses. Enable it only when the WebSocket
                 // port is reachable exclusively through a reverse proxy that overwrites
-                // them. https://github.com/rustdesk/rustdesk-server/issues/634
+                // them. Reference upstream issue #634.
                 let headers = req.headers();
                 let real_ip = headers
                     .get("X-Real-IP")
@@ -707,11 +732,11 @@ async fn make_pair(
             Ok(result) => result?,
             Err(_) => bail!("Relay WebSocket upgrade timed out"),
         };
-        make_pair_(ws_stream, addr, key, limiter, permit).await;
+        make_pair_(ws_stream, addr, &context, permit, socket_guard).await;
     } else {
         let mut stream = FramedStream::from(stream, addr);
         *stream.codec_mut() = BytesCodec::with_max_packet_length(RELAY_CONTROL_FRAME_MAX);
-        make_pair_(stream, addr, key, limiter, permit).await;
+        make_pair_(stream, addr, &context, permit, socket_guard).await;
     }
     Ok(())
 }
@@ -719,15 +744,19 @@ async fn make_pair(
 async fn make_pair_(
     stream: impl StreamTrait,
     addr: SocketAddr,
-    key: &str,
-    limiter: Limiter,
+    context: &RelayContext,
     permit: OwnedSemaphorePermit,
+    socket_guard: AcceptedSocketGuard,
 ) {
     let mut stream = stream;
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
+        let Some(_frame_permit) = context.memory_budget.try_acquire(bytes.len()) else {
+            log::warn!("Relay memory budget exceeded for handshake from {}", addr);
+            return;
+        };
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
-                if !key.is_empty() && rf.licence_key != key {
+                if !context.key.is_empty() && rf.licence_key != *context.key {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }
@@ -761,6 +790,7 @@ async fn make_pair_(
                                     source_ip: addr.ip(),
                                     generation,
                                     _permit: permit,
+                                    _socket_guard: socket_guard,
                                 },
                             );
                             drop(peers);
@@ -778,8 +808,15 @@ async fn make_pair_(
                         log::info!("Both are raw");
                     }
                     ACTIVE_PAIRS.fetch_add(1, Ordering::Relaxed);
-                    let relay_res =
-                        relay(addr, &mut stream, &mut pending.stream, limiter, id.clone()).await;
+                    let relay_res = relay(
+                        addr,
+                        &mut stream,
+                        &mut pending.stream,
+                        context.limiter.clone(),
+                        id.clone(),
+                        context.memory_budget.clone(),
+                    )
+                    .await;
                     ACTIVE_PAIRS.fetch_sub(1, Ordering::Relaxed);
                     if let Err(err) = relay_res {
                         log::info!("Relay of {} closed: {}", addr, err);
@@ -789,6 +826,7 @@ async fn make_pair_(
                     USAGE.write().await.remove(&id);
                     drop(pending);
                     drop(permit);
+                    drop(socket_guard);
                 } else {
                     log::warn!("Rejected malformed relay request from {}", addr);
                 }
@@ -823,6 +861,7 @@ async fn relay(
     peer: &mut Box<dyn StreamTrait>,
     total_limiter: Limiter,
     id: String,
+    memory_budget: Arc<crate::common::MemoryBudget>,
 ) -> ResultType<()> {
     let ip = addr.ip().to_string();
     let mut tm = std::time::Instant::now();
@@ -843,6 +882,10 @@ async fn relay(
         tokio::select! {
             res = peer.recv() => {
                 if let Some(Ok(bytes)) = res {
+                    let Some(_mem_permit) = memory_budget.try_acquire(bytes.len()) else {
+                        log::warn!("Relay memory budget exceeded for data from peer {}", addr);
+                        bail!("Relay memory budget exceeded");
+                    };
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
                     if blacked || downgrade {
@@ -862,6 +905,10 @@ async fn relay(
             },
             res = stream.recv() => {
                 if let Some(Ok(bytes)) = res {
+                    let Some(_mem_permit) = memory_budget.try_acquire(bytes.len()) else {
+                        log::warn!("Relay memory budget exceeded for data from stream {}", addr);
+                        bail!("Relay memory budget exceeded");
+                    };
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
                     if blacked || downgrade {
@@ -1128,10 +1175,13 @@ mod tests {
 
     #[camellia_remote_protocol::tokio::test]
     async fn stale_timeout_cannot_remove_reused_uuid() {
+        let initial_sockets = accepted_sockets();
         let uuid = format!("test-{}", uuid::Uuid::new_v4());
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let guard = AcceptedSocketGuard::new();
         assert_eq!(semaphore.available_permits(), 9);
+        assert_eq!(accepted_sockets(), initial_sockets + 1);
 
         PEERS.lock().await.insert(
             uuid.clone(),
@@ -1140,25 +1190,32 @@ mod tests {
                 source_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 generation: 2,
                 _permit: permit,
+                _socket_guard: guard,
             },
         );
 
         assert!(!remove_pending_if_generation(&uuid, 1).await);
         assert!(PEERS.lock().await.contains_key(&uuid));
         assert_eq!(semaphore.available_permits(), 9);
+        assert_eq!(accepted_sockets(), initial_sockets + 1);
 
         assert!(remove_pending_if_generation(&uuid, 2).await);
         assert!(!PEERS.lock().await.contains_key(&uuid));
-        // RES-004: Removing pending relay returns permit to semaphore
+        // RES-004: Removing pending relay returns permit and decrements socket count
         assert_eq!(semaphore.available_permits(), 10);
+        assert_eq!(accepted_sockets(), initial_sockets);
     }
 
     #[camellia_remote_protocol::tokio::test]
     async fn relay_pairing_holds_both_connection_permits_across_lifecycle() {
+        let initial_sockets = accepted_sockets();
+
         // RES-004: Exactly 2 slots available
         let semaphore = Arc::new(Semaphore::new(2));
         let permit1 = semaphore.clone().try_acquire_owned().unwrap();
+        let guard1 = AcceptedSocketGuard::new();
         assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(accepted_sockets(), initial_sockets + 1);
 
         let uuid = format!("pair-{}", uuid::Uuid::new_v4());
         PEERS.lock().await.insert(
@@ -1168,27 +1225,61 @@ mod tests {
                 source_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 generation: 1,
                 _permit: permit1,
+                _socket_guard: guard1,
             },
         );
 
         // Second connection arrives and acquires second permit
         let permit2 = semaphore.clone().try_acquire_owned().unwrap();
+        let guard2 = AcceptedSocketGuard::new();
         assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(accepted_sockets(), initial_sockets + 2);
 
         // A third connection attempt must fail because all 2 slots are occupied
         assert!(semaphore.clone().try_acquire_owned().is_err());
 
-        // Pairing takes pending relay (with permit 1)
+        // Pairing takes pending relay (with permit 1 and guard 1)
         let pending = PEERS.lock().await.remove(&uuid).unwrap();
         assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(accepted_sockets(), initial_sockets + 2);
 
-        // Both permits remain held while pair is active
+        // Both permits and socket guards remain held while pair is active
         assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(accepted_sockets(), initial_sockets + 2);
 
-        // When relay session closes, both permits are dropped and returned to semaphore
+        // When relay session closes, both permits and guards are dropped
         drop(pending);
         assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(accepted_sockets(), initial_sockets + 1);
         drop(permit2);
+        drop(guard2);
         assert_eq!(semaphore.available_permits(), 2);
+        assert_eq!(accepted_sockets(), initial_sockets);
+    }
+
+    #[test]
+    fn relay_memory_budget_enforces_ceiling_and_raii_return() {
+        let budget = crate::common::MemoryBudget::new(1024 * 1024);
+        assert_eq!(budget.max_bytes(), 1024 * 1024);
+        assert_eq!(budget.used_bytes(), 0);
+
+        let p1 = budget.try_acquire(600 * 1024).expect("acquire 600 KiB");
+        assert_eq!(budget.used_bytes(), 600 * 1024);
+        assert!(budget.try_acquire(500 * 1024).is_none());
+
+        drop(p1);
+        assert_eq!(budget.used_bytes(), 0);
+        let p2 = budget.try_acquire(500 * 1024).expect("acquire 500 KiB");
+        assert_eq!(budget.used_bytes(), 500 * 1024);
+        drop(p2);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn relay_startup_validation_enforces_minimums() {
+        assert!(validate_relay_startup_params(1, 256 * 1024 * 1024).is_err());
+        assert!(validate_relay_startup_params(2, 2 * 1024 * 1024).is_err());
+        assert!(validate_relay_startup_params(2, RELAY_WEBSOCKET_FRAME_MAX).is_ok());
+        assert!(validate_relay_startup_params(8192, 256 * 1024 * 1024).is_ok());
     }
 }

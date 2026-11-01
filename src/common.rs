@@ -12,8 +12,75 @@ use std::{
     io::prelude::*,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Instant, SystemTime},
 };
+
+#[allow(dead_code)]
+pub struct MemoryPermit {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
+#[allow(dead_code)]
+pub struct MemoryBudget {
+    used: Arc<AtomicUsize>,
+    max_bytes: usize,
+}
+
+#[allow(dead_code)]
+impl MemoryBudget {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            used: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+        }
+    }
+
+    pub fn try_acquire(&self, bytes: usize) -> Option<MemoryPermit> {
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            if current.saturating_add(bytes) > self.max_bytes {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(MemoryPermit {
+                        used: self.used.clone(),
+                        bytes,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn used_bytes(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
 
 pub fn parse_bind_address(value: &str) -> Result<Option<IpAddr>> {
     let value = value.trim();
@@ -173,17 +240,26 @@ pub fn load_arg_file(path: &Path) -> ResultType<()> {
         .with_context(|| format!("Unable to open configuration file: {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = file
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = file
             .metadata()
-            .with_context(|| format!("Unable to inspect configuration file: {}", path.display()))?
-            .permissions()
-            .mode();
+            .with_context(|| format!("Unable to inspect configuration file: {}", path.display()))?;
+        let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
             camellia_remote_protocol::bail!(
                 "Configuration file must not be group- or world-writable: {} (mode: {:04o})",
                 path.display(),
                 mode & 0o7777
+            );
+        }
+        let file_uid = metadata.uid();
+        let current_euid = unsafe { libc::geteuid() };
+        if file_uid != 0 && file_uid != current_euid {
+            camellia_remote_protocol::bail!(
+                "Configuration file must be owned by root or running UID: {} (file UID: {}, current UID: {})",
+                path.display(),
+                file_uid,
+                current_euid
             );
         }
     }
@@ -793,6 +869,33 @@ mod tests {
             fs::set_permissions(&world_writable, fs::Permissions::from_mode(0o666)).unwrap();
             assert!(load_arg_file(&world_writable).is_err());
         }
+    }
+
+    #[test]
+    fn memory_budget_enforces_limit_and_raii_return() {
+        let budget = MemoryBudget::new(1024);
+        assert_eq!(budget.max_bytes(), 1024);
+        assert_eq!(budget.used_bytes(), 0);
+
+        let permit1 = budget.try_acquire(600).expect("acquire 600 bytes");
+        assert_eq!(budget.used_bytes(), 600);
+
+        assert!(budget.try_acquire(500).is_none());
+        assert_eq!(budget.used_bytes(), 600);
+
+        let permit2 = budget.try_acquire(424).expect("acquire 424 bytes");
+        assert_eq!(budget.used_bytes(), 1024);
+        assert!(budget.try_acquire(1).is_none());
+
+        drop(permit1);
+        assert_eq!(budget.used_bytes(), 424);
+
+        let permit3 = budget.try_acquire(500).expect("acquire 500 bytes");
+        assert_eq!(budget.used_bytes(), 924);
+
+        drop(permit2);
+        drop(permit3);
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[camellia_remote_protocol::tokio::test]
