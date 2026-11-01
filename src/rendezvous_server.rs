@@ -479,6 +479,14 @@ impl RendezvousServer {
         limiter.allow(&key, cost)
     }
 
+    pub fn validate_rendezvous_port(port: i32) -> ResultType<u16> {
+        if (2..=65_533).contains(&port) {
+            Ok(port as u16)
+        } else {
+            bail!("Rendezvous port must be between 2 and 65533 to accommodate nat_port (port - 1) and ws_port (port + 2)");
+        }
+    }
+
     #[tokio::main(flavor = "multi_thread")]
     pub async fn start_with_bind(
         bind_addr: Option<IpAddr>,
@@ -487,6 +495,7 @@ impl RendezvousServer {
         key: &str,
         rmem: usize,
     ) -> ResultType<()> {
+        Self::validate_rendezvous_port(port)?;
         let (key, sk) = Self::get_server_sk(key)?;
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -3554,5 +3563,33 @@ mod tests {
         assert!(err_msg.contains("must not be empty"), "Error: {}", err_msg);
 
         std::env::remove_var("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN_FILE");
+    }
+
+    #[test]
+    fn rendezvous_port_validation_enforces_bounds_to_prevent_offset_overflow_or_underflow() {
+        // Valid ports: standard port 21116, lower boundary 2, upper boundary 65533
+        assert_eq!(
+            RendezvousServer::validate_rendezvous_port(21116).unwrap(),
+            21116
+        );
+        assert_eq!(RendezvousServer::validate_rendezvous_port(2).unwrap(), 2);
+        assert_eq!(
+            RendezvousServer::validate_rendezvous_port(65533).unwrap(),
+            65533
+        );
+
+        // Invalid ports: 0, 1 (underflow for nat_port), 65534, 65535 (overflow for ws_port), negative, >65535
+        for invalid_port in [0, 1, 65534, 65535, -1, -21116, 70000] {
+            let result = RendezvousServer::validate_rendezvous_port(invalid_port);
+            assert!(
+                result.is_err(),
+                "Expected rendezvous port {invalid_port} to be rejected"
+            );
+            let err_msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                err_msg.contains("Rendezvous port must be between 2 and 65533"),
+                "Unexpected error message for port {invalid_port}: {err_msg}"
+            );
+        }
     }
 }

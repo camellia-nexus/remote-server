@@ -1,7 +1,7 @@
 // https://tools.ietf.org/rfc/rfc5128.txt
 // https://blog.csdn.net/bytxl/article/details/44344855
 
-use camellia_remote_protocol::{bail, config::RENDEZVOUS_PORT, ResultType};
+use camellia_remote_protocol::{config::RENDEZVOUS_PORT, ResultType};
 use camellia_remote_server::{common::*, *};
 use clap::Arg;
 use flexi_logger::*;
@@ -77,9 +77,7 @@ fn main() -> ResultType<()> {
         .or_else(|| get_arg_opt("CAMELLIA_REMOTE_IDENTITY_PORT"))
         .unwrap_or_else(|| RENDEZVOUS_PORT.to_string())
         .parse::<i32>()?;
-    if !(3..=65_533).contains(&port) {
-        bail!("Port must be between 3 and 65533");
-    }
+    RendezvousServer::validate_rendezvous_port(port)?;
     let bind_addr = parse_bind_address(&get_arg("bind"))?;
     let rmem = get_arg_opt("rmem")
         .filter(|value| !value.trim().is_empty())
