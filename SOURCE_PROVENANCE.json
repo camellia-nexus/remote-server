@@ -9,7 +9,7 @@
   },
   "protocol": {
     "repository": "../remote-protocol.git",
-    "commit": "8c6a504989c2cbc07572952c30e236102577297c"
+    "commit": "9007cf0cf6e0d87d077dd886f2bd167e6ffe3e02"
   },
   "historyImported": false,
   "runtimeDataImported": false,
