@@ -53,11 +53,57 @@ jobs:
           CAMELLIA_REMOTE_SERVER_IMAGE: ghcr.io/example/remote-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         run: docker compose config --quiet
 
+  deployment:
+    name: Deployment and automation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Validate systemd units
+        run: python3 scripts/validate_systemd_security.py deploy/systemd/*.service
+
+      - name: Run systemd security validator unit tests
+        run: python3 scripts/test_validate_systemd_security.py
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Resolve image version
+        id: metadata
+        run: python3 scripts/release_metadata.py --github-output
+
+      - name: Build production image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: camellia-remote-server:test
+          provenance: false
+          build-args: |
+            VERSION=${{ steps.metadata.outputs.version }}
+            REVISION=${{ github.sha }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Hardened container runtime smoke test
+        run: bash .github/scripts/smoke-test-container.sh camellia-remote-server:test
+
+      - name: Run container release test suite
+        run: |
+          python3 .github/scripts/test_container_release_evidence.py
+          bash .github/scripts/tests/test_resolve_container_registries.sh
+          bash .github/scripts/tests/test_verify_release_image.sh
+          bash .github/scripts/tests/test_smoke_test_container.sh
+
   required:
     name: CI / Required
     if: always()
     needs:
       - quality
+      - deployment
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -65,8 +111,13 @@ jobs:
         shell: bash
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          DEPLOYMENT_RESULT: ${{ needs.deployment.result }}
         run: |
           [[ "$QUALITY_RESULT" == success ]] || {
             echo "Quality must succeed, got: $QUALITY_RESULT" >&2
+            exit 1
+          }
+          [[ "$DEPLOYMENT_RESULT" == success ]] || {
+            echo "Deployment must succeed, got: $DEPLOYMENT_RESULT" >&2
             exit 1
           }

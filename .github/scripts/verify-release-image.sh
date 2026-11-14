@@ -61,4 +61,10 @@ for architecture in amd64 arm64; do
   [[ "$image_revision" == "$revision" ]]
   [[ "$image_source" == "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" ]]
   [[ "$(docker image inspect --format '{{.Config.User}}' "$local_tag")" == "10001:10001" ]]
+
+  # Execute short-lived hardened container runtime integration check
+  if [[ -z "${DOCKER_CALLS:-}" && "${CAMELLIA_SKIP_SMOKE_TEST:-0}" != "1" ]]; then
+    script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    "$script_directory/smoke-test-container.sh" "$local_tag"
+  fi
 done
