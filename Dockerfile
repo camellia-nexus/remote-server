@@ -31,6 +31,7 @@ RUN groupadd --gid 10001 camellia \
     && chmod 0700 /var/lib/camellia-remote
 
 COPY --from=builder /out/ /usr/local/bin/
+COPY LICENSE NOTICE SOURCE_PROVENANCE.json /usr/local/share/doc/camellia-remote/
 
 USER 10001:10001
 WORKDIR /var/lib/camellia-remote

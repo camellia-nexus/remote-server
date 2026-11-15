@@ -180,6 +180,21 @@ docker exec "$IDENTITY_CID" grep -E "^Cap(Eff|Prm):[[:space:]]+0000000000000000"
   exit 1
 }
 
+# Legal compliance bundle verification (LEGAL-002)
+echo "[smoke-test] Verifying legal compliance bundle in container (LEGAL-002)..."
+docker exec "$IDENTITY_CID" test -f /usr/local/share/doc/camellia-remote/LICENSE || {
+  echo "[smoke-test] ERROR: Missing LICENSE in container" >&2
+  exit 1
+}
+docker exec "$IDENTITY_CID" test -f /usr/local/share/doc/camellia-remote/NOTICE || {
+  echo "[smoke-test] ERROR: Missing NOTICE in container" >&2
+  exit 1
+}
+docker exec "$IDENTITY_CID" test -f /usr/local/share/doc/camellia-remote/SOURCE_PROVENANCE.json || {
+  echo "[smoke-test] ERROR: Missing SOURCE_PROVENANCE.json in container" >&2
+  exit 1
+}
+
 # 7. Test Graceful SIGTERM Shutdown
 echo "[smoke-test] Testing graceful SIGTERM shutdown..."
 docker stop -t 15 "$IDENTITY_CID" >/dev/null

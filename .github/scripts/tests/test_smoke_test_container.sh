@@ -123,6 +123,15 @@ case "$subcmd" in
         fi
         exit 0
         ;;
+      "test -f /usr/local/share/doc/camellia-remote/LICENSE")
+        exit 0
+        ;;
+      "test -f /usr/local/share/doc/camellia-remote/NOTICE")
+        exit 0
+        ;;
+      "test -f /usr/local/share/doc/camellia-remote/SOURCE_PROVENANCE.json")
+        exit 0
+        ;;
       *)
         echo "unexpected exec cmd: $cmd" >&2
         exit 1
