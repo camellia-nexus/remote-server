@@ -861,6 +861,8 @@ impl RendezvousServer {
                     return false;
                 }
                 log::trace!("New peer registered via tcp/ws: {:?} {:?}", rp.id, addr);
+                let peer_id = rp.id.clone();
+                let serial = rp.serial;
                 self.cache_sink(addr, sink).await;
                 let (resp, cu) = match self.register_peer_common(rp, addr).await {
                     Ok(result) => result,
@@ -872,6 +874,20 @@ impl RendezvousServer {
                         return false;
                     }
                 };
+                camellia_remote_protocol::observability::StructuredEvent::new(
+                    "remote-server",
+                    "INFO",
+                    "rendezvous_registration",
+                    &camellia_remote_protocol::observability::generate_trace_id(),
+                    &camellia_remote_protocol::observability::generate_attempt_id(),
+                )
+                .with_stage("rendezvous")
+                .with_result("ok")
+                .with_peer_id(&peer_id)
+                .with_endpoint(addr)
+                .with_attribute("protocol_version", crate::version::VERSION)
+                .with_attribute("serial", serial)
+                .emit();
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_register_peer_response(resp);
                 if !Self::send_to_sink(sink, msg_out) {
@@ -922,6 +938,14 @@ impl RendezvousServer {
                 return true;
             }
             Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                let correlation = if rf.correlation.is_some() {
+                    let mut ctx = rf.correlation.clone().unwrap();
+                    camellia_remote_protocol::observability::CorrelationContextExt::sanitize_in_place(&mut ctx);
+                    ctx
+                } else {
+                    camellia_remote_protocol::observability::CorrelationContextExt::new_random()
+                };
+                rf.correlation = MessageField::some(correlation.clone());
                 if !Self::valid_peer_id(&rf.id)
                     || !Self::valid_relay_uuid(&rf.uuid)
                     || rf.licence_key.len() > 128
@@ -950,6 +974,21 @@ impl RendezvousServer {
                 } else {
                     self.get_relay_server(addr.ip(), peer_addr.ip())
                 };
+                camellia_remote_protocol::observability::StructuredEvent::from_correlation(
+                    "remote-server",
+                    "INFO",
+                    "rendezvous_relay_fallback",
+                    &correlation,
+                )
+                .with_stage("rendezvous")
+                .with_peer_id(&rf.id)
+                .with_endpoint(addr)
+                .with_attribute(
+                    "peer_endpoint_masked",
+                    crate::common::mask_socket_addr(peer_addr),
+                )
+                .with_attribute("relay_server", relay_server.clone())
+                .emit();
                 let rendezvous_token = match self
                     .reserve_pending_rendezvous(
                         addr,
@@ -1488,6 +1527,15 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+        let correlation = if ph.correlation.is_some() {
+            let mut ctx = ph.correlation.clone().unwrap();
+            camellia_remote_protocol::observability::CorrelationContextExt::sanitize_in_place(
+                &mut ctx,
+            );
+            ctx
+        } else {
+            camellia_remote_protocol::observability::CorrelationContextExt::new_random()
+        };
         if !Self::valid_peer_id(&ph.id)
             || ph.licence_key.len() > 128
             || ph.token.len() > 4_096
@@ -1496,10 +1544,12 @@ impl RendezvousServer {
             || !Self::valid_optional_mangled_addr(&ph.socket_addr_v6)
         {
             let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse {
+            let mut resp = PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
                 ..Default::default()
-            });
+            };
+            resp.correlation = MessageField::some(correlation);
+            msg_out.set_punch_hole_response(resp);
             return Ok((msg_out, None));
         }
         if !key.is_empty() && ph.licence_key != key {
@@ -1509,10 +1559,12 @@ impl RendezvousServer {
                 ph.id
             );
             let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse {
+            let mut resp = PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
                 ..Default::default()
-            });
+            };
+            resp.correlation = MessageField::some(correlation);
+            msg_out.set_punch_hole_response(resp);
             return Ok((msg_out, None));
         }
         let id = ph.id;
@@ -1528,10 +1580,12 @@ impl RendezvousServer {
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
-                msg_out.set_punch_hole_response(PunchHoleResponse {
+                let mut resp = PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
                     ..Default::default()
-                });
+                };
+                resp.correlation = MessageField::some(correlation);
+                msg_out.set_punch_hole_response(resp);
                 return Ok((msg_out, None));
             }
 
@@ -1568,13 +1622,35 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            let is_forced_relay = ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan);
+            if is_forced_relay {
                 if peer_is_lan {
                     // Route peer traffic via local IP when peer is within LAN
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
+            let is_relay_fallback =
+                is_forced_relay || ph.force_relay || ph.nat_type == NatType::SYMMETRIC.into();
+
+            if is_relay_fallback {
+                camellia_remote_protocol::observability::StructuredEvent::from_correlation(
+                    "remote-server",
+                    "INFO",
+                    "rendezvous_relay_fallback",
+                    &correlation,
+                )
+                .with_stage("rendezvous")
+                .with_peer_id(&id)
+                .with_endpoint(addr)
+                .with_attribute(
+                    "peer_endpoint_masked",
+                    crate::common::mask_socket_addr(peer_addr),
+                )
+                .with_attribute("relay_server", relay_server.clone())
+                .emit();
+            }
+
             let same_intranet: bool = !ph.force_relay
                 && !ws
                 && (peer_is_lan && is_lan || {
@@ -1584,6 +1660,29 @@ impl RendezvousServer {
                         _ => false,
                     }
                 });
+
+            camellia_remote_protocol::observability::StructuredEvent::from_correlation(
+                "remote-server",
+                "INFO",
+                "rendezvous_punch_hole",
+                &correlation,
+            )
+            .with_stage("rendezvous")
+            .with_peer_id(&id)
+            .with_endpoint(addr)
+            .with_attribute(
+                "peer_endpoint_masked",
+                crate::common::mask_socket_addr(peer_addr),
+            )
+            .with_result(if same_intranet {
+                "local_intranet"
+            } else if is_relay_fallback {
+                "relay_fallback"
+            } else {
+                "direct_punch"
+            })
+            .emit();
+
             let socket_addr = AddrMangle::encode(addr).into();
             let rendezvous_token = self
                 .reserve_pending_rendezvous(
@@ -1609,6 +1708,7 @@ impl RendezvousServer {
                     relay_server,
                     socket_addr_v6: ph.socket_addr_v6,
                     rendezvous_token,
+                    correlation: MessageField::some(correlation.clone()),
                     ..Default::default()
                 });
             } else {
@@ -1625,16 +1725,19 @@ impl RendezvousServer {
                     force_relay: ph.force_relay,
                     socket_addr_v6: ph.socket_addr_v6,
                     rendezvous_token,
+                    correlation: MessageField::some(correlation.clone()),
                     ..Default::default()
                 });
             }
             Ok((msg_out, Some(peer_addr)))
         } else {
             let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse {
+            let mut resp = PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
                 ..Default::default()
-            });
+            };
+            resp.correlation = MessageField::some(correlation);
+            msg_out.set_punch_hole_response(resp);
             Ok((msg_out, None))
         }
     }

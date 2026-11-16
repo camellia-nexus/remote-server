@@ -11,6 +11,7 @@ use camellia_remote_protocol::{
     crypto::sign,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
+    observability::{CorrelationContextExt, StructuredEvent},
     protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
@@ -34,6 +35,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 type Usage = (usize, usize, usize, usize);
@@ -123,6 +125,7 @@ struct PendingRelay {
     stream: Box<dyn StreamTrait>,
     source_ip: IpAddr,
     generation: u64,
+    correlation: CorrelationContext,
     _permit: OwnedSemaphorePermit,
     _socket_guard: AcceptedSocketGuard,
 }
@@ -944,6 +947,13 @@ async fn make_pair_(
                     return;
                 }
                 if valid_relay_uuid(&rf.uuid) && rf.licence_key.len() <= 128 {
+                    let mut correlation = if rf.correlation.is_some() {
+                        let mut ctx = rf.correlation.clone().unwrap();
+                        CorrelationContextExt::sanitize_in_place(&mut ctx);
+                        ctx
+                    } else {
+                        CorrelationContextExt::new_random()
+                    };
                     let mut pending = {
                         let mut peers = PEERS.lock().await;
                         if let Some(pending) = peers.remove(&rf.uuid) {
@@ -976,6 +986,7 @@ async fn make_pair_(
                                     stream: Box::new(stream),
                                     source_ip: addr.ip(),
                                     generation,
+                                    correlation: correlation.clone(),
                                     _permit: permit,
                                     _socket_guard: socket_guard,
                                 },
@@ -986,6 +997,27 @@ async fn make_pair_(
                             return;
                         }
                     };
+                    if correlation.trace_id.is_empty()
+                        || correlation.trace_id == "00000000000000000000000000000000"
+                    {
+                        correlation = pending.correlation.clone();
+                    }
+                    let ip1 = pending.source_ip;
+                    let ip2 = addr.ip();
+
+                    StructuredEvent::from_correlation(
+                        "remote-server",
+                        "INFO",
+                        "relay_allocated",
+                        &correlation,
+                    )
+                    .with_stage("relay")
+                    .with_result("ok")
+                    .with_endpoint(addr)
+                    .with_attribute("peer1_ip_masked", crate::common::mask_ip(ip1))
+                    .with_attribute("peer2_ip_masked", crate::common::mask_ip(ip2))
+                    .with_attribute("uuid_pseudo", crate::common::pseudonymize_uuid(&rf.uuid))
+                    .emit();
                     log::info!(
                         "Relay request {} from {} got paired",
                         crate::common::pseudonymize_uuid(&rf.uuid),
@@ -1033,12 +1065,15 @@ async fn make_pair_(
                         log::info!("Both are raw");
                     }
                     ACTIVE_PAIRS.fetch_add(1, Ordering::Relaxed);
+                    let bytes_transferred = Arc::new(AtomicUsize::new(0));
+                    let relay_start = Instant::now();
                     let session_params = RelaySessionParams {
                         ip1,
                         ip2,
                         addr,
                         id: id.clone(),
                         blacked,
+                        bytes_transferred: bytes_transferred.clone(),
                     };
                     let relay_res = relay(
                         session_params,
@@ -1049,7 +1084,29 @@ async fn make_pair_(
                     )
                     .await;
                     ACTIVE_PAIRS.fetch_sub(1, Ordering::Relaxed);
-                    if let Err(err) = relay_res {
+                    let duration_ms = relay_start.elapsed().as_millis() as u64;
+                    let total_bytes = bytes_transferred.load(Ordering::Relaxed);
+                    let (close_reason, error_code) = match &relay_res {
+                        Ok(()) => ("normal_close", None),
+                        Err(err) => ("error", Some(err.to_string())),
+                    };
+                    let mut evt = StructuredEvent::from_correlation(
+                        "remote-server",
+                        "INFO",
+                        "relay_closed",
+                        &correlation,
+                    )
+                    .with_stage("relay")
+                    .with_result(close_reason)
+                    .with_endpoint(addr)
+                    .with_duration_ms(duration_ms)
+                    .with_attribute("byte_count", total_bytes as u64)
+                    .with_attribute("close_reason", close_reason);
+                    if let Some(ref code) = error_code {
+                        evt = evt.with_error_code(code);
+                    }
+                    evt.emit();
+                    if let Err(err) = &relay_res {
                         log::info!(
                             "Relay of {} closed: {}",
                             crate::common::mask_socket_addr(addr),
@@ -1099,6 +1156,7 @@ struct RelaySessionParams {
     addr: SocketAddr,
     id: String,
     blacked: bool,
+    bytes_transferred: Arc<AtomicUsize>,
 }
 
 async fn relay(
@@ -1114,6 +1172,7 @@ async fn relay(
         addr,
         id,
         mut blacked,
+        bytes_transferred,
     } = params;
     let ip1_guard = IpLimiterGuard::acquire(ip1);
     let ip2_guard = if canonical_ip(ip1) != canonical_ip(ip2) {
@@ -1146,6 +1205,7 @@ async fn relay(
                         bail!("Relay memory budget exceeded");
                     };
                     last_recv_time = std::time::Instant::now();
+                    bytes_transferred.fetch_add(bytes.len(), Ordering::Relaxed);
                     let nb = bytes.len() * 8;
                     ip1_guard.limiter.consume(nb).await;
                     if let Some(ref g2) = ip2_guard {
@@ -1175,6 +1235,7 @@ async fn relay(
                         bail!("Relay memory budget exceeded");
                     };
                     last_recv_time = std::time::Instant::now();
+                    bytes_transferred.fetch_add(bytes.len(), Ordering::Relaxed);
                     let nb = bytes.len() * 8;
                     ip1_guard.limiter.consume(nb).await;
                     if let Some(ref g2) = ip2_guard {
@@ -1535,6 +1596,7 @@ mod tests {
                 stream: Box::new(FakeStream),
                 source_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 generation: 2,
+                correlation: Default::default(),
                 _permit: permit,
                 _socket_guard: guard,
             },
@@ -1571,6 +1633,7 @@ mod tests {
                 stream: Box::new(FakeStream),
                 source_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 generation: 1,
+                correlation: Default::default(),
                 _permit: permit1,
                 _socket_guard: guard1,
             },

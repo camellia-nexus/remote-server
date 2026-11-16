@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+pub mod diagnostics;
 use camellia_remote_protocol::{
     anyhow::{anyhow, Context as _},
     bail,
@@ -28,11 +29,16 @@ Available Commands:
     genkeypair                                   Generate a new keypair
     validatekeypair [public key] [secret key]    Validate an existing keypair
     doctor [remote-server]                       Check for server connection problems
-    healthcheck [options] [host:port]            Verify server reachability and business readiness\n
+    healthcheck [options] [host:port]            Verify server reachability and business readiness
+    support-bundle [options]                     Generate bounded, redacted support diagnostics bundle\n
 Options for healthcheck:
     --readiness                                  Verify rendezvous control channel responsiveness (handshake + Hc)
     --sqlite <path|url>                          Verify SQLite read liveness (SELECT 1)
-    --timeout <seconds>                          Set probe timeout in seconds (default 3)"
+    --timeout <seconds>                          Set probe timeout in seconds (default 3)\n
+Options for support-bundle:
+    --output <path>                              Set output archive path
+    --config-dir <path>                          Set configuration directory to audit
+    --log-dir <path>                             Set log directory to inspect"
     );
 }
 
@@ -441,6 +447,53 @@ fn main() {
                 process::exit(0x0001);
             }
             println!("Healthcheck: OK");
+        }
+        "support-bundle" => {
+            let mut options = diagnostics::SupportBundleOptions::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--output" | "-o" => {
+                        i += 1;
+                        if i >= args.len() {
+                            error_then_help("--output requires a path argument");
+                        }
+                        options.output_path = Some(std::path::PathBuf::from(&args[i]));
+                    }
+                    "--config-dir" => {
+                        i += 1;
+                        if i >= args.len() {
+                            error_then_help("--config-dir requires a directory path");
+                        }
+                        options.config_dir = Some(std::path::PathBuf::from(&args[i]));
+                    }
+                    "--log-dir" => {
+                        i += 1;
+                        if i >= args.len() {
+                            error_then_help("--log-dir requires a directory path");
+                        }
+                        options.log_dir = Some(std::path::PathBuf::from(&args[i]));
+                    }
+                    unknown => {
+                        error_then_help(&format!("Unknown support-bundle option: {unknown}"));
+                    }
+                }
+                i += 1;
+            }
+            let target_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match diagnostics::export_support_bundle(&target_dir, &options) {
+                Ok(path) => {
+                    println!(
+                        "Support bundle successfully generated at: {}",
+                        path.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Failed to generate support bundle: {err:#}");
+                    process::exit(2);
+                }
+            }
         }
         _ => error_then_help("Unknown command"),
     }
