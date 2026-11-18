@@ -1,3 +1,4 @@
 [submodule "libs/camellia_remote_protocol"]
 	path = libs/camellia_remote_protocol
 	url = ../remote-protocol.git
+	branch = main

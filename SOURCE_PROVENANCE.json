@@ -5,7 +5,7 @@
   "source_commit": "f2fc41f4ee66b3d302fdace761593ab6e7c0657d",
   "upstream_repository": "https://github.com/rustdesk/rustdesk-server",
   "protocol_repository": "../remote-protocol.git",
-  "protocol_source_commit": "083a2cd8caff6ff595a0d5ca02d17a972ece2a30",
+  "protocol_source_commit": "1356eaf490c84bb6ab8343f1f9174b338ea2f654",
   "history_policy": "fresh-root-snapshot",
   "license": "AGPL-3.0-only"
 }
