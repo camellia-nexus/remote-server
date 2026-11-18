@@ -5,7 +5,7 @@ use camellia_remote_protocol::anyhow::{anyhow, Context as _};
 use camellia_remote_protocol::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
-    bytes_codec::{BytesCodec, RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH},
+    bytes_codec::BytesCodec,
     config,
     crypto::{box_, secretbox, sign},
     error,
@@ -53,6 +53,7 @@ const HTTP_PROXY_RATE_PER_IP: u32 = 120;
 const HTTP_PROXY_MAX_TRACKED_IPS: usize = 4_096;
 const RENDEZVOUS_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const RENDEZVOUS_CONNECTION_QUEUE_CAPACITY: usize = 64;
+const RENDEZVOUS_CONTROL_FRAME_MAX: usize = 1024 * 1024;
 const RENDEZVOUS_RATE_LIMITER_CAPACITY: f64 = 60.0;
 const RENDEZVOUS_RATE_LIMITER_REFILL_PER_SEC: f64 = 10.0;
 const DEFAULT_MAX_RENDEZVOUS_IN_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
@@ -77,6 +78,12 @@ const _: () = assert!(DEPLOYMENT_VERIFICATION_CACHE_SECS <= 15);
 const DEPLOYMENT_ASSERTION_VERSION: &str = "camellia-deployment-assertion-v1";
 const DEPLOYMENT_ASSERTION_MAX_FUTURE_SECS: i64 = 60;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
 
 fn http_proxy_error(status: i32, code: ErrorCode) -> HttpProxyResponse {
     let mut response = HttpProxyResponse {
@@ -472,7 +479,7 @@ struct RendezvousListeners {
 
 impl RendezvousServer {
     fn next_deployment_verification_sequence(&self) -> u64 {
-        match self.deployment_verification_sequence.fetch_update(
+        match self.deployment_verification_sequence.try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |sequence| sequence.checked_add(1),
@@ -2035,7 +2042,9 @@ impl RendezvousServer {
         }
         let public_key_hash = sha256_hex(public_key);
         let mut nonce = [0_u8; 32];
-        OsRng.fill_bytes(&mut nonce);
+        SysRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|e| anyhow!("{e}"))?;
         let request_nonce = BASE64.encode(nonce);
         let response = self
             .inner
@@ -2659,7 +2668,7 @@ impl RendezvousServer {
             return;
         }
         let mut stream = FramedStream::from(stream, addr);
-        *stream.codec_mut() = BytesCodec::with_max_packet_length(RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH);
+        *stream.codec_mut() = BytesCodec::with_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
         tokio::spawn(async move {
             let _permit = permit;
             let mut stream = stream;
@@ -2904,8 +2913,8 @@ impl RendezvousServer {
                 .read_buffer_size(16 * 1024)
                 .write_buffer_size(16 * 1024)
                 .max_write_buffer_size(1024 * 1024)
-                .max_message_size(Some(RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH))
-                .max_frame_size(Some(RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH));
+                .max_message_size(Some(RENDEZVOUS_CONTROL_FRAME_MAX))
+                .max_frame_size(Some(RENDEZVOUS_CONTROL_FRAME_MAX));
             let mut ws_stream = match timeout(
                 HANDSHAKE_WAIT_MS,
                 tokio_tungstenite::accept_hdr_async_with_config(
@@ -3010,7 +3019,7 @@ impl RendezvousServer {
             // to initiate the secure handshake. This avoids a deadlock where both
             // client and server are waiting for each other.
             let mut stream = FramedStream::from(stream, addr);
-            *stream.codec_mut() = BytesCodec::with_max_packet_length(RENDEZVOUS_CONTROL_MAX_PACKET_LENGTH);
+            *stream.codec_mut() = BytesCodec::with_max_packet_length(RENDEZVOUS_CONTROL_FRAME_MAX);
 
             let _session_key = self.attempt_handshake(&mut stream).await?;
             let (tx, mut rx) =
