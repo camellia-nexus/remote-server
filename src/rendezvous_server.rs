@@ -105,17 +105,58 @@ struct PunchReqEntry {
     to_id: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingRendezvousKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendezvousResponseKind {
     Direct,
     Local,
     Relay,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingRendezvousResults {
+    DirectOrRelay,
+    LocalOrRelay,
+    RelayOnly,
+}
+
+impl PendingRendezvousResults {
+    fn allows(self, response: RendezvousResponseKind) -> bool {
+        matches!(
+            (self, response),
+            (
+                Self::DirectOrRelay,
+                RendezvousResponseKind::Direct | RendezvousResponseKind::Relay
+            ) | (
+                Self::LocalOrRelay,
+                RendezvousResponseKind::Local | RendezvousResponseKind::Relay
+            ) | (Self::RelayOnly, RendezvousResponseKind::Relay)
+        )
+    }
+}
+
+fn pending_results_for_punch(
+    force_relay: bool,
+    server_forces_relay: bool,
+    requester_is_symmetric: bool,
+    same_network: bool,
+) -> PendingRendezvousResults {
+    if force_relay || server_forces_relay {
+        PendingRendezvousResults::RelayOnly
+    } else if same_network {
+        // A requester's public NAT classification does not prevent a local-address
+        // connection. The responder can still fall back to relay if local setup fails.
+        PendingRendezvousResults::LocalOrRelay
+    } else if requester_is_symmetric {
+        PendingRendezvousResults::RelayOnly
+    } else {
+        PendingRendezvousResults::DirectOrRelay
+    }
+}
+
 struct PendingRendezvous {
     requester: SocketAddr,
     responder_id: String,
-    kind: PendingRendezvousKind,
+    allowed_results: PendingRendezvousResults,
     relay_server: String,
     created_at: Instant,
 }
@@ -131,7 +172,7 @@ fn consume_pending_rendezvous_in(
     token: &Bytes,
     responder_id: &str,
     claimed_requester: SocketAddr,
-    expected_kind: Option<PendingRendezvousKind>,
+    response_kind: RendezvousResponseKind,
     now: Instant,
 ) -> ResultType<ConsumedRendezvous> {
     if token.len() != RENDEZVOUS_TOKEN_LEN {
@@ -147,7 +188,7 @@ fn consume_pending_rendezvous_in(
         bail!("Expired rendezvous token");
     }
     if entry.responder_id != responder_id
-        || expected_kind.is_some_and(|kind| entry.kind != kind)
+        || !entry.allowed_results.allows(response_kind)
         || entry.requester != try_into_v4(claimed_requester)
     {
         bail!("Rendezvous response does not match its request");
@@ -993,7 +1034,7 @@ impl RendezvousServer {
                     .reserve_pending_rendezvous(
                         addr,
                         rf.id.clone(),
-                        PendingRendezvousKind::Relay,
+                        PendingRendezvousResults::RelayOnly,
                         relay_server.clone(),
                     )
                     .await
@@ -1046,7 +1087,7 @@ impl RendezvousServer {
                         &rr.rendezvous_token,
                         &id,
                         &rr.socket_addr,
-                        Some(PendingRendezvousKind::Relay),
+                        RendezvousResponseKind::Relay,
                     )
                     .await
                 {
@@ -1400,7 +1441,7 @@ impl RendezvousServer {
                 &phs.rendezvous_token,
                 &phs.id,
                 &phs.socket_addr,
-                Some(PendingRendezvousKind::Direct),
+                RendezvousResponseKind::Direct,
             )
             .await?;
         let addr_a = pending.requester;
@@ -1443,7 +1484,7 @@ impl RendezvousServer {
                 &la.rendezvous_token,
                 &la.id,
                 &la.socket_addr,
-                Some(PendingRendezvousKind::Local),
+                RendezvousResponseKind::Local,
             )
             .await?;
         let addr_a = pending.requester;
@@ -1466,7 +1507,7 @@ impl RendezvousServer {
         &self,
         requester: SocketAddr,
         responder_id: String,
-        kind: PendingRendezvousKind,
+        allowed_results: PendingRendezvousResults,
         relay_server: String,
     ) -> ResultType<Bytes> {
         let mut pending = self.pending_rendezvous.lock().await;
@@ -1486,7 +1527,7 @@ impl RendezvousServer {
                     PendingRendezvous {
                         requester: try_into_v4(requester),
                         responder_id,
-                        kind,
+                        allowed_results,
                         relay_server,
                         created_at: Instant::now(),
                     },
@@ -1501,7 +1542,7 @@ impl RendezvousServer {
         token: &Bytes,
         responder_id: &str,
         claimed_requester: &[u8],
-        expected_kind: Option<PendingRendezvousKind>,
+        response_kind: RendezvousResponseKind,
     ) -> ResultType<ConsumedRendezvous> {
         let claimed_requester = AddrMangle::try_decode(claimed_requester)
             .filter(|addr| addr.port() != 0)
@@ -1513,7 +1554,7 @@ impl RendezvousServer {
             token,
             responder_id,
             claimed_requester,
-            expected_kind,
+            response_kind,
             Instant::now(),
         )
     }
@@ -1622,16 +1663,32 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            let is_forced_relay = ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan);
-            if is_forced_relay {
-                if peer_is_lan {
-                    // Route peer traffic via local IP when peer is within LAN
-                    relay_server = self.inner.local_ip.clone()
-                }
+            let always_use_relay = ALWAYS_USE_RELAY.load(Ordering::SeqCst);
+            let crosses_lan_boundary = peer_is_lan ^ is_lan;
+            let server_forces_relay = always_use_relay || crosses_lan_boundary || ws;
+            if (always_use_relay || crosses_lan_boundary) && peer_is_lan {
+                // Route peer traffic via local IP when peer is within LAN
+                relay_server = self.inner.local_ip.clone()
+            }
+            if server_forces_relay {
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
-            let is_relay_fallback =
-                is_forced_relay || ph.force_relay || ph.nat_type == NatType::SYMMETRIC.into();
+
+            let same_network = peer_is_lan && is_lan || {
+                match (peer_addr, addr) {
+                    (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
+                    (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
+                    _ => false,
+                }
+            };
+            let allowed_results = pending_results_for_punch(
+                ph.force_relay,
+                server_forces_relay,
+                ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC),
+                same_network,
+            );
+            let same_intranet = allowed_results == PendingRendezvousResults::LocalOrRelay;
+            let is_relay_fallback = allowed_results == PendingRendezvousResults::RelayOnly;
 
             if is_relay_fallback {
                 camellia_remote_protocol::observability::StructuredEvent::from_correlation(
@@ -1650,16 +1707,6 @@ impl RendezvousServer {
                 .with_attribute("relay_server", relay_server.clone())
                 .emit();
             }
-
-            let same_intranet: bool = !ph.force_relay
-                && !ws
-                && (peer_is_lan && is_lan || {
-                    match (peer_addr, addr) {
-                        (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-                        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                        _ => false,
-                    }
-                });
 
             camellia_remote_protocol::observability::StructuredEvent::from_correlation(
                 "remote-server",
@@ -1682,19 +1729,9 @@ impl RendezvousServer {
                 "direct_punch"
             })
             .emit();
-
             let socket_addr = AddrMangle::encode(addr).into();
             let rendezvous_token = self
-                .reserve_pending_rendezvous(
-                    addr,
-                    id.clone(),
-                    if same_intranet {
-                        PendingRendezvousKind::Local
-                    } else {
-                        PendingRendezvousKind::Direct
-                    },
-                    relay_server.clone(),
-                )
+                .reserve_pending_rendezvous(addr, id.clone(), allowed_results, relay_server.clone())
                 .await?;
             if same_intranet {
                 log::debug!(
@@ -3077,6 +3114,160 @@ mod tests {
     }
 
     #[test]
+    fn punch_requests_reserve_the_minimal_allowed_results() {
+        for (force_relay, server_forces_relay, symmetric, same_network, expected) in [
+            (
+                false,
+                false,
+                false,
+                false,
+                PendingRendezvousResults::DirectOrRelay,
+            ),
+            (
+                false,
+                false,
+                false,
+                true,
+                PendingRendezvousResults::LocalOrRelay,
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                PendingRendezvousResults::RelayOnly,
+            ),
+            (
+                false,
+                false,
+                true,
+                true,
+                PendingRendezvousResults::LocalOrRelay,
+            ),
+        ] {
+            assert_eq!(
+                pending_results_for_punch(
+                    force_relay,
+                    server_forces_relay,
+                    symmetric,
+                    same_network,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pending_rendezvous_result_matrix_is_minimal() {
+        let now = Instant::now();
+        let requester = SocketAddr::from(([192, 0, 2, 10], 45_000));
+        let cases = [
+            (
+                PendingRendezvousResults::DirectOrRelay,
+                RendezvousResponseKind::Direct,
+                true,
+            ),
+            (
+                PendingRendezvousResults::DirectOrRelay,
+                RendezvousResponseKind::Local,
+                false,
+            ),
+            (
+                PendingRendezvousResults::DirectOrRelay,
+                RendezvousResponseKind::Relay,
+                true,
+            ),
+            (
+                PendingRendezvousResults::LocalOrRelay,
+                RendezvousResponseKind::Direct,
+                false,
+            ),
+            (
+                PendingRendezvousResults::LocalOrRelay,
+                RendezvousResponseKind::Local,
+                true,
+            ),
+            (
+                PendingRendezvousResults::LocalOrRelay,
+                RendezvousResponseKind::Relay,
+                true,
+            ),
+            (
+                PendingRendezvousResults::RelayOnly,
+                RendezvousResponseKind::Direct,
+                false,
+            ),
+            (
+                PendingRendezvousResults::RelayOnly,
+                RendezvousResponseKind::Local,
+                false,
+            ),
+            (
+                PendingRendezvousResults::RelayOnly,
+                RendezvousResponseKind::Relay,
+                true,
+            ),
+        ];
+
+        for (index, (allowed_results, response_kind, accepted)) in cases.into_iter().enumerate() {
+            let token = Bytes::from(vec![index as u8; RENDEZVOUS_TOKEN_LEN]);
+            let mut pending = HashMap::from([(
+                token.clone(),
+                PendingRendezvous {
+                    requester,
+                    responder_id: "device01".to_owned(),
+                    allowed_results,
+                    relay_server: "relay.example.com:21117".to_owned(),
+                    created_at: now,
+                },
+            )]);
+            let result = consume_pending_rendezvous_in(
+                &mut pending,
+                &token,
+                "device01",
+                requester,
+                response_kind,
+                now,
+            );
+
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{allowed_results:?} / {response_kind:?}"
+            );
+            assert_eq!(pending.contains_key(&token), !accepted);
+        }
+    }
+
+    #[test]
     fn rendezvous_tokens_are_one_shot_and_bound_to_the_request() {
         let now = Instant::now();
         let requester = SocketAddr::from(([192, 0, 2, 10], 45_000));
@@ -3086,30 +3277,65 @@ mod tests {
             PendingRendezvous {
                 requester,
                 responder_id: "device01".to_owned(),
-                kind: PendingRendezvousKind::Direct,
+                allowed_results: PendingRendezvousResults::DirectOrRelay,
                 relay_server: "relay.example.com:21117".to_owned(),
                 created_at: now,
             },
         )]);
 
+        for (responder_id, claimed_requester, response_kind) in [
+            ("other-device", requester, RendezvousResponseKind::Direct),
+            (
+                "device01",
+                SocketAddr::from(([192, 0, 2, 10], 45_001)),
+                RendezvousResponseKind::Direct,
+            ),
+            ("device01", requester, RendezvousResponseKind::Local),
+        ] {
+            assert!(consume_pending_rendezvous_in(
+                &mut pending,
+                &token,
+                responder_id,
+                claimed_requester,
+                response_kind,
+                now,
+            )
+            .is_err());
+            assert!(pending.contains_key(&token));
+        }
+
+        let missing = Bytes::from(vec![6; RENDEZVOUS_TOKEN_LEN]);
         assert!(consume_pending_rendezvous_in(
             &mut pending,
-            &token,
+            &missing,
             "device01",
             requester,
-            Some(PendingRendezvousKind::Local),
-            now
+            RendezvousResponseKind::Relay,
+            now,
         )
         .is_err());
         assert!(pending.contains_key(&token));
+
+        let malformed = Bytes::from_static(b"short");
+        assert!(consume_pending_rendezvous_in(
+            &mut pending,
+            &malformed,
+            "device01",
+            requester,
+            RendezvousResponseKind::Relay,
+            now,
+        )
+        .is_err());
+        assert!(pending.contains_key(&token));
+
         assert_eq!(
             consume_pending_rendezvous_in(
                 &mut pending,
                 &token,
                 "device01",
                 requester,
-                Some(PendingRendezvousKind::Direct),
-                now
+                RendezvousResponseKind::Relay,
+                now,
             )
             .unwrap(),
             ConsumedRendezvous {
@@ -3123,10 +3349,46 @@ mod tests {
             &token,
             "device01",
             requester,
-            Some(PendingRendezvousKind::Direct),
-            now
+            RendezvousResponseKind::Relay,
+            now,
         )
         .is_err());
+    }
+
+    #[camellia_remote_protocol::tokio::test]
+    async fn concurrent_duplicate_rendezvous_response_consumes_once() {
+        let now = Instant::now();
+        let requester = SocketAddr::from(([192, 0, 2, 10], 45_000));
+        let token = Bytes::from(vec![8; RENDEZVOUS_TOKEN_LEN]);
+        let pending = Arc::new(TokioMutex::new(HashMap::from([(
+            token.clone(),
+            PendingRendezvous {
+                requester,
+                responder_id: "device01".to_owned(),
+                allowed_results: PendingRendezvousResults::DirectOrRelay,
+                relay_server: "relay.example.com:21117".to_owned(),
+                created_at: now,
+            },
+        )])));
+
+        let consume = |pending: Arc<TokioMutex<HashMap<Bytes, PendingRendezvous>>>| {
+            let token = token.clone();
+            async move {
+                let mut pending = pending.lock().await;
+                consume_pending_rendezvous_in(
+                    &mut pending,
+                    &token,
+                    "device01",
+                    requester,
+                    RendezvousResponseKind::Relay,
+                    now,
+                )
+            }
+        };
+        let (first, second) = tokio::join!(consume(pending.clone()), consume(pending.clone()));
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(pending.lock().await.is_empty());
     }
 
     #[test]
@@ -3139,7 +3401,7 @@ mod tests {
             PendingRendezvous {
                 requester,
                 responder_id: "device01".to_owned(),
-                kind: PendingRendezvousKind::Direct,
+                allowed_results: PendingRendezvousResults::DirectOrRelay,
                 relay_server: String::new(),
                 created_at: now - Duration::from_secs(PENDING_RENDEZVOUS_TTL_SECS + 1),
             },
@@ -3150,8 +3412,8 @@ mod tests {
             &token,
             "device01",
             requester,
-            Some(PendingRendezvousKind::Direct),
-            now
+            RendezvousResponseKind::Direct,
+            now,
         )
         .is_err());
         assert!(!pending.contains_key(&token));
