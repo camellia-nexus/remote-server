@@ -1,0 +1,15 @@
+{
+  "max_relative_mad": 0.08,
+  "metrics": {
+    "trusted_proxy_resolve_ns": {
+      "absolute_max": 100000,
+      "absolute_min": 1,
+      "direction": "lower",
+      "max_regression_percent": 5,
+      "unit": "ns"
+    }
+  },
+  "min_samples": 5,
+  "scenario": "server-trusted-proxy-v1",
+  "schema": "camellia-performance-policy-v1"
+}

@@ -102,12 +102,93 @@ jobs:
           bash .github/scripts/tests/test_verify_release_image.sh
           bash .github/scripts/tests/test_smoke_test_container.sh
 
+  performance-smoke:
+    name: Server performance contract smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          submodules: recursive
+      - name: Checkout exact control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+          submodules: recursive
+      - name: Install exact toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # zizmor: ignore[superfluous-actions]
+        with:
+          toolchain: "1.99.1"
+      - name: Validate shared performance contract
+        run: python3 -m unittest -v tools.test_performance_contract
+        working-directory: candidate/libs/camellia_remote_protocol
+      - name: Build and compare production parser observations
+        env:
+          CANDIDATE_REVISION: ${{ github.event.pull_request.head.sha }}
+          CONTROL_REVISION: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0755 control/examples
+          install -m 0644 \
+            candidate/examples/performance_observation.rs \
+            control/examples/performance_observation.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/server-performance-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path control/Cargo.toml
+          install -m 0755 \
+            "$RUNNER_TEMP/server-performance-target/release/examples/performance_observation" \
+            "$RUNNER_TEMP/server-control-observation"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/server-performance-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path candidate/Cargo.toml
+          install -m 0755 \
+            "$RUNNER_TEMP/server-performance-target/release/examples/performance_observation" \
+            "$RUNNER_TEMP/server-candidate-observation"
+          python3 candidate/libs/camellia_remote_protocol/tools/performance_contract.py collect-pair \
+            --repository remote-server \
+            --control-revision "$CONTROL_REVISION" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --scenario server-trusted-proxy-v1 \
+            --tier pr-smoke \
+            --runner-class github-ubuntu-24.04-x64 \
+            --toolchain rust-1.99.1 \
+            --iterations 5 --warmups 1 --timeout-seconds 30 \
+            --control-output "$RUNNER_TEMP/server-control-performance.json" \
+            --candidate-output "$RUNNER_TEMP/server-candidate-performance.json" \
+            -- "$RUNNER_TEMP/server-control-observation" \
+            ::: "$RUNNER_TEMP/server-candidate-observation"
+          python3 candidate/libs/camellia_remote_protocol/tools/performance_contract.py compare \
+            "$RUNNER_TEMP/server-control-performance.json" \
+            "$RUNNER_TEMP/server-candidate-performance.json" \
+            candidate/performance/server-trusted-proxy-v1.json \
+            --output "$RUNNER_TEMP/server-performance-comparison.json"
+      - name: Upload bounded performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-performance-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/server-control-performance.json
+            ${{ runner.temp }}/server-candidate-performance.json
+            ${{ runner.temp }}/server-performance-comparison.json
+          if-no-files-found: error
+          retention-days: 14
+
   required:
     name: CI / Required
     if: always()
     needs:
       - quality
       - deployment
+      - performance-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -116,6 +197,8 @@ jobs:
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           DEPLOYMENT_RESULT: ${{ needs.deployment.result }}
+          PERFORMANCE_SMOKE_RESULT: ${{ needs.performance-smoke.result }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           [[ "$QUALITY_RESULT" == success ]] || {
             echo "Quality must succeed, got: $QUALITY_RESULT" >&2
@@ -125,3 +208,14 @@ jobs:
             echo "Deployment must succeed, got: $DEPLOYMENT_RESULT" >&2
             exit 1
           }
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            [[ "$PERFORMANCE_SMOKE_RESULT" == success ]] || {
+              echo "Performance smoke must succeed, got: $PERFORMANCE_SMOKE_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$PERFORMANCE_SMOKE_RESULT" == skipped ]] || {
+              echo "Performance smoke must be skipped outside pull requests, got: $PERFORMANCE_SMOKE_RESULT" >&2
+              exit 1
+            }
+          fi

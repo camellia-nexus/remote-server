@@ -1,0 +1,7 @@
+# Server performance evidence
+
+The committed policies and workflows use the exact `remote-protocol` submodule revision as the evidence contract. `server-trusted-proxy-v1` repeatedly exercises the production `TrustedProxyConfig::resolve_client_ip` path and checks the resolved address on every batch. Control and candidate are exact Git revisions built on one runner; the current observation source is overlaid onto an older control revision only to make the two revisions emit a comparable schema.
+
+PRs run five paired smoke samples. Main and scheduled runs use 15 pairs with five seconds of work per observation. A release dispatch requires an explicit control SHA and uses five pairs, no extra warmup, and 60 seconds per observation, so the configured control-plus-candidate workload is ten minutes. Evidence binds both revisions, the hashed runner fingerprint, exact Rust toolchain, policy, input digests, and bounded metrics without recording IP addresses or request headers.
+
+The three policies are separate and progressively stricter. Excessive noise and deterministic regressions both fail closed with distinct artifact-backed states. If the workflow or collector is reverted, a server release that touches parsing, proxy trust, connection handling, or resource limits must be measured manually with the same exact revisions, runner, scenario, policy, and ten-minute maximum until an equivalent gate is restored.

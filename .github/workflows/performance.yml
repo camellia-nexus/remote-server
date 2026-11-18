@@ -1,0 +1,163 @@
+name: Performance
+
+on:
+  schedule:
+    - cron: "53 4 * * 3"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: Evidence tier
+        required: true
+        default: scheduled
+        type: choice
+        options:
+          - scheduled
+          - release
+      control_revision:
+        description: Exact 40-character control SHA; required for release
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-server-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: ${{ github.event_name == 'schedule' && 'Scheduled' || inputs.tier }} A/B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: Resolve immutable A/B inputs
+        id: inputs
+        working-directory: candidate
+        shell: bash
+        env:
+          CANDIDATE_REVISION: ${{ github.sha }}
+          CONTROL_INPUT: ${{ inputs.control_revision }}
+          TIER_INPUT: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          candidate="$(git rev-parse HEAD)"
+          [[ "$candidate" == "$CANDIDATE_REVISION" && "$candidate" =~ ^[0-9a-f]{40}$ ]]
+          tier="${TIER_INPUT:-scheduled}"
+          [[ "$tier" == scheduled || "$tier" == release ]]
+          if [[ -n "$CONTROL_INPUT" ]]; then
+            [[ "$CONTROL_INPUT" =~ ^[0-9a-f]{40}$ ]]
+            control="$CONTROL_INPUT"
+          else
+            [[ "$tier" == scheduled ]]
+            control="$(git rev-parse HEAD^)"
+          fi
+          [[ "$control" != "$candidate" ]]
+          if [[ "$tier" == release ]]; then
+            iterations=5
+            warmups=0
+            work_seconds=60
+            timeout_seconds=90
+          else
+            iterations=15
+            warmups=1
+            work_seconds=5
+            timeout_seconds=30
+          fi
+          {
+            echo "candidate=$candidate"
+            echo "control=$control"
+            echo "iterations=$iterations"
+            echo "policy=performance/server-trusted-proxy-v1.$tier.json"
+            echo "tier=$tier"
+            echo "timeout_seconds=$timeout_seconds"
+            echo "warmups=$warmups"
+            echo "work_seconds=$work_seconds"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ steps.inputs.outputs.control }}
+          submodules: recursive
+
+      - name: Install exact toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # zizmor: ignore[superfluous-actions]
+        with:
+          toolchain: "1.99.1"
+
+      - name: Validate shared performance contract
+        run: python3 -m unittest -v tools.test_performance_contract
+        working-directory: candidate/libs/camellia_remote_protocol
+
+      - name: Build and compare bounded parser observations
+        env:
+          CAMELLIA_PERFORMANCE_WORK_SECONDS: ${{ steps.inputs.outputs.work_seconds }}
+          CANDIDATE_REVISION: ${{ steps.inputs.outputs.candidate }}
+          CONTROL_REVISION: ${{ steps.inputs.outputs.control }}
+          ITERATIONS: ${{ steps.inputs.outputs.iterations }}
+          POLICY: ${{ steps.inputs.outputs.policy }}
+          TIER: ${{ steps.inputs.outputs.tier }}
+          TIMEOUT_SECONDS: ${{ steps.inputs.outputs.timeout_seconds }}
+          WARMUPS: ${{ steps.inputs.outputs.warmups }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0755 control/examples
+          install -m 0644 \
+            candidate/examples/performance_observation.rs \
+            control/examples/performance_observation.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/server-performance-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path control/Cargo.toml
+          install -m 0755 \
+            "$RUNNER_TEMP/server-performance-target/release/examples/performance_observation" \
+            "$RUNNER_TEMP/server-control-observation"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/server-performance-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path candidate/Cargo.toml
+          install -m 0755 \
+            "$RUNNER_TEMP/server-performance-target/release/examples/performance_observation" \
+            "$RUNNER_TEMP/server-candidate-observation"
+          python3 candidate/libs/camellia_remote_protocol/tools/performance_contract.py collect-pair \
+            --repository remote-server \
+            --control-revision "$CONTROL_REVISION" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --scenario server-trusted-proxy-v1 \
+            --tier "$TIER" \
+            --runner-class github-ubuntu-24.04-x64 \
+            --toolchain rust-1.99.1 \
+            --iterations "$ITERATIONS" --warmups "$WARMUPS" \
+            --timeout-seconds "$TIMEOUT_SECONDS" \
+            --control-output "$RUNNER_TEMP/server-control-performance.json" \
+            --candidate-output "$RUNNER_TEMP/server-candidate-performance.json" \
+            -- "$RUNNER_TEMP/server-control-observation" \
+            ::: "$RUNNER_TEMP/server-candidate-observation"
+          python3 candidate/libs/camellia_remote_protocol/tools/performance_contract.py compare \
+            "$RUNNER_TEMP/server-control-performance.json" \
+            "$RUNNER_TEMP/server-candidate-performance.json" \
+            "candidate/$POLICY" \
+            --output "$RUNNER_TEMP/server-performance-comparison.json"
+
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-${{ steps.inputs.outputs.tier }}-${{ steps.inputs.outputs.candidate }}
+          path: |
+            ${{ runner.temp }}/server-control-performance.json
+            ${{ runner.temp }}/server-candidate-performance.json
+            ${{ runner.temp }}/server-performance-comparison.json
+          if-no-files-found: error
+          retention-days: 30
