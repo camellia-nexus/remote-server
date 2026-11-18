@@ -8,6 +8,7 @@ use camellia_remote_protocol::{
     bytes_codec::BytesCodec,
     config,
     crypto::{box_, secretbox, sign},
+    error,
     futures::future::join_all,
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
@@ -73,6 +74,15 @@ const PEER_CACHE_CLEANUP_INTERVAL_SECS: u64 = 300;
 const PEER_CACHE_IDLE_SECS: u64 = 600;
 const DEPLOYMENT_VERIFICATION_CACHE_SECS: u64 = 30;
 const HC_KEEP_ALIVE_SECS: i32 = 10;
+
+fn http_proxy_error(status: i32, code: ErrorCode) -> HttpProxyResponse {
+    let mut response = HttpProxyResponse {
+        status,
+        ..Default::default()
+    };
+    response.typed_error = MessageField::some(error::for_code(code));
+    response
+}
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -1161,17 +1171,9 @@ impl RendezvousServer {
                         "Rejected unauthorized API proxy request from {}",
                         crate::common::mask_socket_addr(addr)
                     );
-                    HttpProxyResponse {
-                        status: 403,
-                        error: "API proxy authorization failed".to_owned(),
-                        ..Default::default()
-                    }
+                    http_proxy_error(403, ErrorCode::PERMISSION_DENIED)
                 } else if !self.allow_http_proxy_request(addr.ip()).await {
-                    HttpProxyResponse {
-                        status: 429,
-                        error: "API proxy rate limit exceeded".to_owned(),
-                        ..Default::default()
-                    }
+                    http_proxy_error(429, ErrorCode::RATE_LIMITED)
                 } else {
                     match self.inner.http_proxy_slots.clone().try_acquire_owned() {
                         Ok(_permit) => match self.handle_http_proxy_request(req, addr.ip()).await {
@@ -1182,18 +1184,10 @@ impl RendezvousServer {
                                     crate::common::mask_socket_addr(addr),
                                     err
                                 );
-                                HttpProxyResponse {
-                                    status: 502,
-                                    error: "API upstream request failed".to_owned(),
-                                    ..Default::default()
-                                }
+                                http_proxy_error(502, ErrorCode::HTTP_PROXY_FAILED)
                             }
                         },
-                        Err(_) => HttpProxyResponse {
-                            status: 503,
-                            error: "API proxy is busy".to_owned(),
-                            ..Default::default()
-                        },
+                        Err(_) => http_proxy_error(503, ErrorCode::SERVICE_BUSY),
                     }
                 };
                 let mut msg_out = RendezvousMessage::new();
@@ -3453,6 +3447,23 @@ mod tests {
             "wrong-key"
         ));
         assert!(!RendezvousServer::http_proxy_authorized(true, "", ""));
+    }
+
+    #[test]
+    fn api_proxy_failures_use_the_typed_error_contract() {
+        for (status, code) in [
+            (403, ErrorCode::PERMISSION_DENIED),
+            (429, ErrorCode::RATE_LIMITED),
+            (502, ErrorCode::HTTP_PROXY_FAILED),
+            (503, ErrorCode::SERVICE_BUSY),
+        ] {
+            let response = http_proxy_error(status, code);
+            assert_eq!(response.status, status);
+            assert!(response.error.is_empty());
+            let typed = response.typed_error.as_ref().expect("typed proxy error");
+            assert!(error::is_valid_for(typed, error::ErrorContext::HttpProxy));
+            assert_eq!(typed.code.enum_value(), Ok(code));
+        }
     }
 
     #[test]
