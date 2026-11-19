@@ -1730,10 +1730,16 @@ mod tests {
     #[camellia_remote_protocol::tokio::test]
     async fn test_net012_console_write_timeout_protection() {
         use camellia_remote_protocol::tokio::io::AsyncWriteExt;
-        let (_client, mut server) = camellia_remote_protocol::tokio::io::duplex(64);
-        let data = vec![0u8; 128];
-        let write_fut = async { server.write_all(&data).await };
-        let res = timeout(50, write_fut).await;
-        assert!(res.is_err(), "Unread write must be bounded by timeout");
+        let limiter = Limiter::new(1024.0 * 1024.0);
+        let res = check_cmd("h", limiter).await;
+        assert!(!res.is_empty(), "Console help response must not be empty");
+
+        let (_client, mut server) = camellia_remote_protocol::tokio::io::duplex(16);
+        let write_fut = async { server.write_all(res.as_bytes()).await };
+        let timed_out = timeout(50, write_fut).await;
+        assert!(
+            timed_out.is_err(),
+            "Unread console response write must be bounded by timeout"
+        );
     }
 }
