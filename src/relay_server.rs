@@ -818,18 +818,20 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, ws: bool, contex
                         } else {
                             check_cmd(cmd, limiter).await
                         };
-                        stream.write_all(res.as_bytes()).await.ok();
+                        timeout(1000, stream.write_all(res.as_bytes())).await.ok();
                     } else {
                         log::warn!(
                             "Unauthorized relay runtime console access attempt from {}",
                             crate::common::mask_socket_addr(addr)
                         );
-                        stream
-                            .write_all(
+                        timeout(
+                            1000,
+                            stream.write_all(
                                 b"Unauthorized: invalid or missing console authentication token\n",
-                            )
-                            .await
-                            .ok();
+                            ),
+                        )
+                        .await
+                        .ok();
                     }
                 }
             }
@@ -1218,7 +1220,10 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        match timeout(30_000, stream.send_raw(bytes.into())).await {
+                            Ok(res) => res?,
+                            Err(_) => bail!("Relay stream send timeout"),
+                        }
                     }
                 } else {
                     break;
@@ -1248,7 +1253,10 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        match timeout(30_000, peer.send_raw(bytes.into())).await {
+                            Ok(res) => res?,
+                            Err(_) => bail!("Relay peer send timeout"),
+                        }
                     }
                 } else {
                     break;
@@ -1690,5 +1698,42 @@ mod tests {
         assert!(validate_relay_startup_params(2, 2 * 1024 * 1024).is_err());
         assert!(validate_relay_startup_params(2, RELAY_WEBSOCKET_FRAME_MAX).is_ok());
         assert!(validate_relay_startup_params(8192, 256 * 1024 * 1024).is_ok());
+    }
+
+    struct HangingStream;
+
+    #[async_trait]
+    impl StreamTrait for HangingStream {
+        async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
+            None
+        }
+
+        async fn send_raw(&mut self, _bytes: Bytes) -> ResultType<()> {
+            camellia_remote_protocol::tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        }
+
+        fn is_ws(&self) -> bool {
+            false
+        }
+
+        fn set_raw(&mut self) {}
+    }
+
+    #[camellia_remote_protocol::tokio::test]
+    async fn test_net012_relay_send_raw_timeout_protection() {
+        let mut hanging = HangingStream;
+        let res = timeout(50, hanging.send_raw(Bytes::from_static(b"test"))).await;
+        assert!(res.is_err(), "Hanging send_raw must timeout");
+    }
+
+    #[camellia_remote_protocol::tokio::test]
+    async fn test_net012_console_write_timeout_protection() {
+        use camellia_remote_protocol::tokio::io::AsyncWriteExt;
+        let (_client, mut server) = camellia_remote_protocol::tokio::io::duplex(64);
+        let data = vec![0u8; 128];
+        let write_fut = async { server.write_all(&data).await };
+        let res = timeout(50, write_fut).await;
+        assert!(res.is_err(), "Unread write must be bounded by timeout");
     }
 }

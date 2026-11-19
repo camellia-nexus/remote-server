@@ -2651,16 +2651,20 @@ impl RendezvousServer {
                             } else {
                                 rs.check_cmd(cmd).await
                             };
-                            stream.write_all(res.as_bytes()).await.ok();
+                            timeout(1000, stream.write_all(res.as_bytes())).await.ok();
                         } else {
                             log::warn!(
                                 "Unauthorized rendezvous runtime console access attempt from {}",
                                 crate::common::mask_socket_addr(addr)
                             );
-                            stream
-                                .write_all(b"Unauthorized: invalid or missing console authentication token\n")
-                                .await
-                                .ok();
+                            timeout(
+                                1000,
+                                stream.write_all(
+                                    b"Unauthorized: invalid or missing console authentication token\n",
+                                ),
+                            )
+                            .await
+                            .ok();
                         }
                     }
                 }
